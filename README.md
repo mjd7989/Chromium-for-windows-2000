@@ -5,7 +5,7 @@ and more stable way for all users to experience the web.
 
 Chromium was never officially supported on Windows 2000. This repositority contains versions compatible with Windows 2000 and older XP service packs.
 
-This project was made possible thanks to the excellent patches created by @e3kskoy7wqk, included in the [Chromium-for-windows-7-REWORK](https://github.com/e3kskoy7wqk/Chromium-for-windows-7-REWORK) repository (huge thanks to @e3kskoy7wqk!).
+This project was made possible thanks to the excellent patches created by **e3kskoy7wqk**, included in the [Chromium-for-windows-7-REWORK](https://github.com/e3kskoy7wqk/Chromium-for-windows-7-REWORK) repository (huge thanks to **e3kskoy7wqk**!).
 
 ## Platform Support
 
