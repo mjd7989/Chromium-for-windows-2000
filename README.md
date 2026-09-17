@@ -14,4 +14,4 @@ This project was made possible thanks to the excellent patches created by e3ksko
 * *Windows XP x86 SP3, XP x64 and newer:* Use the [Chromium-for-windows-7-REWORK](https://github.com/e3kskoy7wqk/Chromium-for-windows-7-REWORK) builds instead.
 * *Windows Whistler and late Windows 2000 Beta builds:* Might work, but not oficially supported.
 
-![](2026-09-16_20h11_50.png)
+![](app.png)
