@@ -9,9 +9,9 @@ This project was made possible thanks to the excellent patches created by **e3ks
 
 ## Platform Support
 
-* **Windows 2000 (SP0–SP4)** (including **Extended Kernel v3.1l**)
+* **Windows 2000 (SP0–SP4)** (including **Extended Kernel v3.1l** and **UURollup v11**)
 * **Windows XP x86 (SP0–SP2)**
 * *Windows XP x86 SP3, XP x64 and newer:* Use the [Chromium-for-windows-7-REWORK](https://github.com/e3kskoy7wqk/Chromium-for-windows-7-REWORK) builds instead.
-* *Windows Whistler and late Windows 2000 Beta builds:* Might work, but not oficially supported.
+* *Windows Whistler, Longhorn (excluding 4093-5356), late Windows 2000 Beta builds:* Might work, but not oficially supported.
 
 ![](app.png)
