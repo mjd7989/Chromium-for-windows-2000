@@ -1,0 +1,4917 @@
+diff --git a/base/i18n/win/preferred_languages.cc b/base/i18n/win/preferred_languages.cc
+index 70b01a8aaf..6b8c017a0c 100644
+--- a/base/i18n/win/preferred_languages.cc
++++ b/base/i18n/win/preferred_languages.cc
+@@ -15,6 +15,7 @@
+ #include "base/strings/string_split.h"
+ #include "base/strings/string_util.h"
+ #include "base/strings/utf_string_conversions.h"
++#include "base/win/windows_version.h"
+ 
+ namespace base::i18n {
+ namespace {
+@@ -58,6 +59,10 @@ bool GetMUIPreferredUILanguageList(LanguageFunction function, ULONG flags,
+   DCHECK_EQ((flags & (MUI_LANGUAGE_ID | MUI_LANGUAGE_NAME)), 0U);
+   DCHECK(languages);
+ 
++  if (base::win::GetVersion() < base::win::Version::VISTA) {
++    return false;
++  }
++
+   HMODULE kernel32 = GetModuleHandle(L"kernel32.dll");
+   if (NULL != kernel32) {
+     typedef BOOL (WINAPI* GetPreferredUILanguages_Fn)(
+diff --git a/base/process/process_metrics_win.cc b/base/process/process_metrics_win.cc
+index 91a4c2eb9d..f472443bc8 100644
+--- a/base/process/process_metrics_win.cc
++++ b/base/process/process_metrics_win.cc
+@@ -24,10 +24,29 @@
+ #include "base/trace_event/trace_event.h"
+ #include "base/values.h"
+ #include "build/build_config.h"
++#include "base/win/windows_version.h"
+ 
+ namespace base {
+ namespace {
+ 
++bool IsXpRtm() {
++  static const bool is_xp_rtm = []() {
++    OSVERSIONINFOEXW osvi = { sizeof(osvi) };
++    using RtlGetVersionPtr = NTSTATUS(WINAPI*)(POSVERSIONINFOEXW);
++    HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
++    if (ntdll) {
++      auto rtl_get_version = reinterpret_cast<RtlGetVersionPtr>(
++          ::GetProcAddress(ntdll, "RtlGetVersion"));
++      if (rtl_get_version && rtl_get_version(&osvi) == 0) {
++        return osvi.dwMajorVersion == 5 && osvi.dwMinorVersion == 1 &&
++               osvi.wServicePackMajor == 0;
++      }
++    }
++    return false;
++  }();
++  return is_xp_rtm;
++}
++
+ // ntstatus.h conflicts with windows.h so define this locally.
+ #define STATUS_SUCCESS ((NTSTATUS)0x00000000L)
+ 
+@@ -168,15 +187,25 @@ ProcessMetrics::GetMemoryInfo() const {
+   if (!process_.is_valid()) {
+     return base::unexpected(ProcessUsageError::kProcessNotFound);
+   }
++  ProcessMemoryInfo counters;
++  if (base::win::GetVersion() <= base::win::Version::PRE_XP || IsXpRtm()) {
++    PROCESS_MEMORY_COUNTERS pmc;
++    pmc.cb = sizeof(pmc);
++    if (!::GetProcessMemoryInfo(process_.get(), &pmc, sizeof(pmc))) {
++      return base::unexpected(ProcessUsageError::kSystemError);
++    }
++    counters.resident_set_bytes = pmc.WorkingSetSize;
++    counters.private_bytes = pmc.PagefileUsage; 
++  } else {
+   PROCESS_MEMORY_COUNTERS_EX pmc;
+   if (!::GetProcessMemoryInfo(process_.get(),
+                               reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc),
+                               sizeof(pmc))) {
+     return base::unexpected(ProcessUsageError::kSystemError);
+   }
+-  ProcessMemoryInfo counters;
+   counters.private_bytes = pmc.PrivateUsage;
+   counters.resident_set_bytes = pmc.WorkingSetSize;
++  }
+   return counters;
+ }
+ 
+diff --git a/base/process/process_win.cc b/base/process/process_win.cc
+index 6c683cfd9d..57fa98d8b9 100644
+--- a/base/process/process_win.cc
++++ b/base/process/process_win.cc
+@@ -253,6 +253,9 @@ bool Process::WaitForExit(int* exit_code) const {
+ 
+ bool Process::WaitForExitWithTimeout(TimeDelta timeout, int* exit_code) const {
+   TRACE_EVENT0("base", "Process::WaitForExitWithTimeout");
++  if (win::GetVersion() <= win::Version::XP) {
++    timeout = TimeDelta();
++  }
+ 
+   if (!timeout.is_zero()) {
+     // Assert that this thread is allowed to wait below. This intentionally
+diff --git a/base/synchronization/condition_variable_win.cc b/base/synchronization/condition_variable_win.cc
+index c0351642d8..3456761a30 100644
+--- a/base/synchronization/condition_variable_win.cc
++++ b/base/synchronization/condition_variable_win.cc
+@@ -16,6 +16,7 @@
+ #include "base/threading/scoped_blocking_call.h"
+ #include "base/threading/thread_restrictions.h"
+ #include "base/time/time.h"
++#include "base/win/windows_version.h"
+ 
+ namespace {
+ // We can't use the linker supported delay-load for kernel32 so all this
+@@ -651,7 +652,9 @@ code review and validate its correctness.
+ 
+ ConditionVariable::ConditionVariable(Lock* user_lock)
+     : impl_(NULL) {
+-  static bool use_vista_native_cv = BindVistaCondVarFunctions();
++
++  static bool use_vista_native_cv = (base::win::GetVersion() >= base::win::Version::VISTA) &&
++                                    BindVistaCondVarFunctions();
+   if (use_vista_native_cv)
+     impl_= new WinVistaCondVar(user_lock);
+   else
+diff --git a/base/time/time_win.cc b/base/time/time_win.cc
+index 0411d927d7..95e0c9cee2 100644
+--- a/base/time/time_win.cc
++++ b/base/time/time_win.cc
+@@ -42,6 +42,7 @@
+ #include <atomic>
+ #include <ostream>
+ 
++#include "base/win/windows_version.h"
+ #include "base/base_switches.h"
+ #include "base/bit_cast.h"
+ #include "base/check_op.h"
+@@ -58,6 +59,24 @@ namespace base {
+ 
+ namespace {
+ 
++bool IsXpRtm() {
++  static const bool is_xp_rtm = []() {
++    OSVERSIONINFOEXW osvi = { sizeof(osvi) };
++    using RtlGetVersionPtr = NTSTATUS(WINAPI*)(POSVERSIONINFOEXW);
++    HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
++    if (ntdll) {
++      auto rtl_get_version = reinterpret_cast<RtlGetVersionPtr>(
++          ::GetProcAddress(ntdll, "RtlGetVersion"));
++      if (rtl_get_version && rtl_get_version(&osvi) == 0) {
++        return osvi.dwMajorVersion == 5 && osvi.dwMinorVersion == 1 &&
++               osvi.wServicePackMajor == 0;
++      }
++    }
++    return false;
++  }();
++  return is_xp_rtm;
++}
++
+ // From MSDN, FILETIME "Contains a 64-bit value representing the number of
+ // 100-nanosecond intervals since January 1, 1601 (UTC)."
+ int64_t FileTimeToMicroseconds(const FILETIME& ft) {
+@@ -149,6 +168,9 @@ UINT GetIntervalMs() {
+ // requested and update if necessary (by cancelling the old request and making a
+ // new request). If there is no change then do nothing.
+ void UpdateTimerIntervalLocked() {
++  if (IsXpRtm()) {
++    return;
++  }
+   UINT new_interval = GetIntervalMs();
+   if (new_interval == g_last_interval_requested_ms) {
+     return;
+@@ -397,6 +419,9 @@ namespace {
+ // mock function, and to avoid a static constructor.  Assigning an import to a
+ // function pointer directly would require setup code to fetch from the IAT.
+ DWORD timeGetTimeWrapper() {
++  if (IsXpRtm()) {
++    return ::GetTickCount();
++  }
+   return timeGetTime();
+ }
+ 
+@@ -863,21 +888,34 @@ ThreadTicks ThreadTicks::GetForThread(
+       FileTimeToMicroseconds(user_time) + FileTimeToMicroseconds(kernel_time);
+ #else
+   // Get the number of TSC ticks used by the current thread.
++  int64_t us = 0;
+   ULONG64 thread_cycle_time = 0;
+-  GetQueryThreadCycleTimeFunction()(::GetCurrentThread(), &thread_cycle_time);
+ 
+-  // Get the frequency of the TSC.
+-  const double tsc_ticks_per_second = time_internal::TSCTicksPerSecond();
+-  if (tsc_ticks_per_second == 0) {
+-    return ThreadTicks();
+-  }
++  auto query_fn = GetQueryThreadCycleTimeFunction();
++  if (query_fn && query_fn(thread_handle.platform_handle(), &thread_cycle_time)) {
++    // Get the frequency of the TSC.
++    const double tsc_ticks_per_second = time_internal::TSCTicksPerSecond();
++    if (tsc_ticks_per_second == 0) {
++      return ThreadTicks();
++    }
+ 
+   // Return the CPU time of the current thread.
+   const double thread_time_seconds = thread_cycle_time / tsc_ticks_per_second;
+-  const int64_t us =
+-      static_cast<int64_t>(thread_time_seconds * Time::kMicrosecondsPerSecond);
++    us = static_cast<int64_t>(thread_time_seconds * Time::kMicrosecondsPerSecond);
++  } else {
++    FILETIME creation_time, exit_time, kernel_time, user_time;
++    if (!::GetThreadTimes(thread_handle.platform_handle(), &creation_time,
++                          &exit_time, &kernel_time, &user_time)) {
++      return ThreadTicks();
++    }
++    us = FileTimeToMicroseconds(user_time) + FileTimeToMicroseconds(kernel_time);
++  }
+ #endif
+ 
++  if (us < 0) {
++    return ThreadTicks();
++  }
++
+   return ThreadTicks(us);
+ }
+ 
+@@ -888,7 +926,7 @@ bool ThreadTicks::IsSupportedWin() {
+   // not care about the time stamp counter.
+   return true;
+ #else
+-  return GetQueryThreadCycleTimeFunction() && time_internal::HasConstantRateTSC();
++  return true;
+ #endif
+ }
+ 
+diff --git a/base/trace_event/process_memory_dump.cc b/base/trace_event/process_memory_dump.cc
+index a759d3c382..d444545950 100644
+--- a/base/trace_event/process_memory_dump.cc
++++ b/base/trace_event/process_memory_dump.cc
+@@ -41,6 +41,7 @@
+ #include <windows.h>  // Must be in front of other Windows header files
+ 
+ #include <Psapi.h>
++#include "base/win/windows_version.h"
+ #endif
+ 
+ #if BUILDFLAG(IS_FUCHSIA)
+@@ -106,6 +107,12 @@ std::optional<size_t> ProcessMemoryDump::CountResidentBytes(
+       base::bits::AlignUp(start_pointer + mapped_size, page_size);
+   const size_t mapped_size_aligned = aligned_end - aligned_start;
+ 
++#if BUILDFLAG(IS_WIN)
++  if (base::win::GetVersion() <= base::win::Version::PRE_XP) {
++    return std::nullopt;
++  }
++#endif
++
+   bool failure = false;
+ 
+   // An array as large as number of pages in memory segment needs to be passed
+diff --git a/base/win/dllmain.cc b/base/win/dllmain.cc
+index f1bb5adc15..7b756cef63 100644
+--- a/base/win/dllmain.cc
++++ b/base/win/dllmain.cc
+@@ -3,1295 +3,255 @@
+ // found in the LICENSE file.
+ 
+ #include <windows.h>
++#include <tlhelp32.h>
++#include <winternl.h>
+ 
+ #include "base/compiler_specific.h"
+ #include "base/win/win_util.h"
+ 
+-#pragma comment(lib, "ntdll.lib")
++namespace {
+ 
+-#ifdef __cplusplus
+-extern "C" {
+-#endif
++constexpr size_t kTebTlsOffset = sizeof(void*) == 8 ? 0x58 : 0x2C;
+ 
+-//
+-// Logical Data Type - These are 32-bit logical values.
+-//
++constexpr size_t kPebOsMajorOffset = sizeof(void*) == 8 ? 0x118 : 0xA4;
++constexpr size_t kPebOsMinorOffset = sizeof(void*) == 8 ? 0x11C : 0xA8;
++constexpr size_t kPebOsBuildOffset = sizeof(void*) == 8 ? 0x120 : 0xAC;
+ 
+-typedef ULONG LOGICAL;
+-typedef ULONG *PLOGICAL;
++struct ThreadBasicInfo {
++  LONG exit_status;
++  PVOID teb_base;
++  PVOID unique_process;
++  PVOID unique_thread;
++  ULONG_PTR affinity_mask;
++  LONG priority;
++  LONG base_priority;
++};
+ 
+-// begin_ntndis begin_windbgkd
+-//
+-// NTSTATUS
+-//
++using NtQueryInformationThreadFn = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
++using RtlGetVersionFn = LONG(NTAPI*)(PRTL_OSVERSIONINFOW);
+ 
+-typedef LONG NTSTATUS;
+-/*lint -save -e624 */  // Don't complain about different typedefs.
+-typedef NTSTATUS *PNTSTATUS;
+-/*lint -restore */  // Resume checking for different typedefs.
++const IMAGE_TLS_DIRECTORY* g_tls_dir = nullptr;
++ULONG g_tls_index = 0;
++bool g_tls_active = false;
+ 
+-//
+-//  Status values are 32 bit values layed out as follows:
+-//
+-//   3 3 2 2 2 2 2 2 2 2 2 2 1 1 1 1 1 1 1 1 1 1
+-//   1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0
+-//  +---+-+-------------------------+-------------------------------+
+-//  |Sev|C|       Facility          |               Code            |
+-//  +---+-+-------------------------+-------------------------------+
+-//
+-//  where
+-//
+-//      Sev - is the severity code
+-//
+-//          00 - Success
+-//          01 - Informational
+-//          10 - Warning
+-//          11 - Error
+-//
+-//      C - is the Customer code flag
+-//
+-//      Facility - is the facility code
+-//
+-//      Code - is the facility's status code
+-//
+-
+-//
+-// Generic test for success on any status value (non-negative numbers
+-// indicate success).
+-//
+-
+-#define NT_SUCCESS(Status) ((NTSTATUS)(Status) >= 0)
+-
+-//
+-// Unicode strings are counted 16-bit character strings. If they are
+-// NULL terminated, Length does not include trailing NULL.
+-//
+-
+-typedef struct _UNICODE_STRING {
+-    USHORT Length;
+-    USHORT MaximumLength;
+-#ifdef MIDL_PASS
+-    [size_is(MaximumLength / 2), length_is((Length) / 2) ] USHORT * Buffer;
+-#else // MIDL_PASS
+-    PWSTR  Buffer;
+-#endif // MIDL_PASS
+-} UNICODE_STRING;
+-typedef UNICODE_STRING *PUNICODE_STRING;
+-typedef const UNICODE_STRING *PCUNICODE_STRING;
+-#define UNICODE_NULL ((WCHAR)0) // winnt
+-
+-typedef struct _OBJECT_ATTRIBUTES {
+-    ULONG Length;
+-    HANDLE RootDirectory;
+-    PUNICODE_STRING ObjectName;
+-    ULONG Attributes;
+-    PVOID SecurityDescriptor;        // Points to type SECURITY_DESCRIPTOR
+-    PVOID SecurityQualityOfService;  // Points to type SECURITY_QUALITY_OF_SERVICE
+-} OBJECT_ATTRIBUTES;
+-typedef OBJECT_ATTRIBUTES *POBJECT_ATTRIBUTES;
+-typedef CONST OBJECT_ATTRIBUTES *PCOBJECT_ATTRIBUTES;
+-
+-//++
+-//
+-// VOID
+-// InitializeObjectAttributes(
+-//     OUT POBJECT_ATTRIBUTES p,
+-//     IN PUNICODE_STRING n,
+-//     IN ULONG a,
+-//     IN HANDLE r,
+-//     IN PSECURITY_DESCRIPTOR s
+-//     )
+-//
+-//--
+-
+-#define InitializeObjectAttributes( p, n, a, r, s ) { \
+-    (p)->Length = sizeof( OBJECT_ATTRIBUTES );          \
+-    (p)->RootDirectory = r;                             \
+-    (p)->Attributes = a;                                \
+-    (p)->ObjectName = n;                                \
+-    (p)->SecurityDescriptor = s;                        \
+-    (p)->SecurityQualityOfService = NULL;               \
+-    }
+-
+-//
+-// The success status codes 0 - 63 are reserved for wait completion status.
+-// FacilityCodes 0x5 - 0xF have been allocated by various drivers.
+-//
+-#define STATUS_SUCCESS                          ((NTSTATUS)0x00000000L) // ntsubauth
+-
+-//
+-// MessageId: STATUS_INVALID_INFO_CLASS
+-//
+-// MessageText:
+-//
+-//  {Invalid Parameter}
+-//  The specified information class is not a valid information class for the specified object.
+-//
+-#define STATUS_INVALID_INFO_CLASS        ((NTSTATUS)0xC0000003L)    // ntsubauth
+-
+-//
+-// MessageId: STATUS_INFO_LENGTH_MISMATCH
+-//
+-// MessageText:
+-//
+-//  The specified information record length does not match the length required for the specified information class.
+-//
+-#define STATUS_INFO_LENGTH_MISMATCH      ((NTSTATUS)0xC0000004L)
+-
+-//
+-// Thread priority
+-//
+-
+-typedef LONG KPRIORITY;
+-
+-struct _TEB *
+-NtCurrentTeb(void);
+-
+-//
+-// Loader Data Table. Used to track DLLs loaded into an
+-// image.
+-//
+-
+-typedef struct _LDR_DATA_TABLE_ENTRY {
+-    LIST_ENTRY InLoadOrderLinks;
+-    LIST_ENTRY InMemoryOrderLinks;
+-    LIST_ENTRY InInitializationOrderLinks;
+-    PVOID DllBase;
+-    PVOID EntryPoint;
+-    ULONG SizeOfImage;
+-    UNICODE_STRING FullDllName;
+-    UNICODE_STRING BaseDllName;
+-    ULONG Flags;
+-    USHORT LoadCount;
+-    USHORT TlsIndex;
+-    union {
+-        LIST_ENTRY HashLinks;
+-        struct {
+-            PVOID SectionPointer;
+-            ULONG CheckSum;
+-        };
+-    };
+-    union {
+-        struct {
+-            ULONG TimeDateStamp;
+-        };
+-        struct {
+-            PVOID LoadedImports;
+-        };
+-    };
+-    struct _ACTIVATION_CONTEXT * EntryPointActivationContext;
+-    
+-    PVOID PatchInformation; 
+-    
+-} LDR_DATA_TABLE_ENTRY, *PLDR_DATA_TABLE_ENTRY;
+-
+-//
+-// Process Environment Block
+-//
+-#ifdef _MAC
+-#pragma warning( disable : 4121)
+-#endif
+-
+-typedef struct _PEB_LDR_DATA {
+-    ULONG Length;
+-    BOOLEAN Initialized;
+-    HANDLE SsHandle;
+-    LIST_ENTRY InLoadOrderModuleList;
+-    LIST_ENTRY InMemoryOrderModuleList;
+-    LIST_ENTRY InInitializationOrderModuleList;
+-    PVOID EntryInProgress;
+-} PEB_LDR_DATA, *PPEB_LDR_DATA;
+-
+-#ifdef _MAC
+-#pragma warning( default : 4121 )
+-#endif
+-//
+-// Handle tag bits for Peb Stdio File Handles
+-//
+-
+-#define PEB_STDIO_HANDLE_NATIVE     0
+-#define PEB_STDIO_HANDLE_SUBSYS     1
+-#define PEB_STDIO_HANDLE_PM         2
+-#define PEB_STDIO_HANDLE_RESERVED   3
+-
+-#define GDI_HANDLE_BUFFER_SIZE32  34
+-#define GDI_HANDLE_BUFFER_SIZE64  60
+-
+-#if !defined(_IA64_) && !defined(_AMD64_)
+-#define GDI_HANDLE_BUFFER_SIZE      GDI_HANDLE_BUFFER_SIZE32
+-#else
+-#define GDI_HANDLE_BUFFER_SIZE      GDI_HANDLE_BUFFER_SIZE64
+-#endif
+-
+-typedef ULONG GDI_HANDLE_BUFFER32[GDI_HANDLE_BUFFER_SIZE32];
+-typedef ULONG GDI_HANDLE_BUFFER64[GDI_HANDLE_BUFFER_SIZE64];
+-typedef ULONG GDI_HANDLE_BUFFER  [GDI_HANDLE_BUFFER_SIZE  ];
+-
+-#define FOREGROUND_BASE_PRIORITY  9
+-#define NORMAL_BASE_PRIORITY      8
+-
+-typedef struct _PEB_FREE_BLOCK {
+-    struct _PEB_FREE_BLOCK *Next;
+-    ULONG Size;
+-} PEB_FREE_BLOCK, *PPEB_FREE_BLOCK;
+-
+-// begin_ntddk begin_wdm begin_nthal begin_ntifs
+-//
+-// ClientId
+-//
+-
+-typedef struct _CLIENT_ID {
+-    HANDLE UniqueProcess;
+-    HANDLE UniqueThread;
+-} CLIENT_ID;
+-typedef CLIENT_ID *PCLIENT_ID;
+-
+-// end_ntddk end_wdm end_nthal end_ntifs
+-
+-#if !defined(CLIENT_ID64_DEFINED)
+-
+-typedef struct _CLIENT_ID64 {
+-    ULONGLONG  UniqueProcess;
+-    ULONGLONG  UniqueThread;
+-} CLIENT_ID64;
+-
+-typedef CLIENT_ID64 *PCLIENT_ID64;
+-
+-#define CLIENT_ID64_DEFINED
+-
+-#endif
+-
+-#define FLS_MAXIMUM_AVAILABLE 128   // winnt
+-#define TLS_MINIMUM_AVAILABLE 64    // winnt
+-#define TLS_EXPANSION_SLOTS   1024
+-
+-typedef
+-VOID
+-(*PPS_POST_PROCESS_INIT_ROUTINE) (
+-    VOID
+-    );
+-
+-//
+-// Gdi command batching
+-//
+-
+-#define GDI_BATCH_BUFFER_SIZE 310
+-
+-typedef struct _GDI_TEB_BATCH {
+-    ULONG    Offset;
+-    ULONG_PTR HDC;
+-    ULONG    Buffer[GDI_BATCH_BUFFER_SIZE];
+-} GDI_TEB_BATCH,*PGDI_TEB_BATCH;
+-
+-
+-//
+-// Wx86 thread state information
+-//
+-
+-typedef struct _Wx86ThreadState {
+-    PULONG  CallBx86Eip;
+-    PVOID   DeallocationCpu;
+-    BOOLEAN UseKnownWx86Dll;
+-    char    OleStubInvoked;
+-} WX86THREAD, *PWX86THREAD;
+-
+-//
+-//  TEB - The thread environment block
+-//
+-
+-#define STATIC_UNICODE_BUFFER_LENGTH 261
+-#define WIN32_CLIENT_INFO_LENGTH 62
+-
+-#define WIN32_CLIENT_INFO_SPIN_COUNT 1
+-
+-typedef PVOID* PPVOID;
+-
+-#define PEBTEB_PRIVATE_PASTE(x,y)       x##y
+-#define PEBTEB_PASTE(x,y)               PEBTEB_PRIVATE_PASTE(x,y)
+-
+-//
+-// Declare and use regular native types.
+-//
+-#define PEBTEB_POINTER(x) x
+-#define PEBTEB_STRUCT(x)  x
+-
+-/* for searching
+-typedef struct _PEB
+-typedef struct _PEB32
+-typedef struct _PEB64
+-*/
+-typedef struct PEBTEB_STRUCT(_PEB) {
+-    BOOLEAN InheritedAddressSpace;      // These four fields cannot change unless the
+-    BOOLEAN ReadImageFileExecOptions;   //
+-    BOOLEAN BeingDebugged;              //
+-    BOOLEAN SpareBool;                  //
+-    PEBTEB_POINTER(HANDLE) Mutant;      // INITIAL_PEB structure is also updated.
+-
+-    PEBTEB_POINTER(PVOID) ImageBaseAddress;
+-    PEBTEB_POINTER(PPEB_LDR_DATA) Ldr;
+-    PEBTEB_POINTER(struct _RTL_USER_PROCESS_PARAMETERS*) ProcessParameters;
+-    PEBTEB_POINTER(PVOID) SubSystemData;
+-    PEBTEB_POINTER(PVOID) ProcessHeap;
+-    PEBTEB_POINTER(struct _RTL_CRITICAL_SECTION*) FastPebLock;
+-    PEBTEB_POINTER(PVOID) SparePtr1;
+-    PEBTEB_POINTER(PVOID) SparePtr2;
+-    ULONG EnvironmentUpdateCount;
+-    PEBTEB_POINTER(PVOID) KernelCallbackTable;
+-    ULONG SystemReserved[1];
+-
+-    struct {
+-        ULONG ExecuteOptions : 2;
+-        ULONG SpareBits : 30;
+-    };    
+-
+-
+-    PEBTEB_POINTER(PPEB_FREE_BLOCK) FreeList;
+-    ULONG TlsExpansionCounter;
+-    PEBTEB_POINTER(PVOID) TlsBitmap;
+-    ULONG TlsBitmapBits[2];         // TLS_MINIMUM_AVAILABLE bits
+-    PEBTEB_POINTER(PVOID) ReadOnlySharedMemoryBase;
+-    PEBTEB_POINTER(PVOID) ReadOnlySharedMemoryHeap;
+-    PEBTEB_POINTER(PPVOID) ReadOnlyStaticServerData;
+-    PEBTEB_POINTER(PVOID) AnsiCodePageData;
+-    PEBTEB_POINTER(PVOID) OemCodePageData;
+-    PEBTEB_POINTER(PVOID) UnicodeCaseTableData;
+-
+-    //
+-    // Useful information for LdrpInitialize
+-    ULONG NumberOfProcessors;
+-    ULONG NtGlobalFlag;
+-
+-    //
+-    // Passed up from MmCreatePeb from Session Manager registry key
+-    //
+-
+-    LARGE_INTEGER CriticalSectionTimeout;
+-    PEBTEB_POINTER(SIZE_T) HeapSegmentReserve;
+-    PEBTEB_POINTER(SIZE_T) HeapSegmentCommit;
+-    PEBTEB_POINTER(SIZE_T) HeapDeCommitTotalFreeThreshold;
+-    PEBTEB_POINTER(SIZE_T) HeapDeCommitFreeBlockThreshold;
+-
+-    //
+-    // Where heap manager keeps track of all heaps created for a process
+-    // Fields initialized by MmCreatePeb.  ProcessHeaps is initialized
+-    // to point to the first free byte after the PEB and MaximumNumberOfHeaps
+-    // is computed from the page size used to hold the PEB, less the fixed
+-    // size of this data structure.
+-    //
+-
+-    ULONG NumberOfHeaps;
+-    ULONG MaximumNumberOfHeaps;
+-    PEBTEB_POINTER(PPVOID) ProcessHeaps;
+-
+-    //
+-    //
+-    PEBTEB_POINTER(PVOID) GdiSharedHandleTable;
+-    PEBTEB_POINTER(PVOID) ProcessStarterHelper;
+-    ULONG GdiDCAttributeList;
+-    PEBTEB_POINTER(struct _RTL_CRITICAL_SECTION*) LoaderLock;
+-
+-    //
+-    // Following fields filled in by MmCreatePeb from system values and/or
+-    // image header.
+-    //
+-
+-    ULONG OSMajorVersion;
+-    ULONG OSMinorVersion;
+-    USHORT OSBuildNumber;
+-    USHORT OSCSDVersion;
+-    ULONG OSPlatformId;
+-    ULONG ImageSubsystem;
+-    ULONG ImageSubsystemMajorVersion;
+-    ULONG ImageSubsystemMinorVersion;
+-    PEBTEB_POINTER(ULONG_PTR) ImageProcessAffinityMask;
+-    PEBTEB_STRUCT(GDI_HANDLE_BUFFER) GdiHandleBuffer;
+-    PEBTEB_POINTER(PPS_POST_PROCESS_INIT_ROUTINE) PostProcessInitRoutine;
+-
+-    PEBTEB_POINTER(PVOID) TlsExpansionBitmap;
+-    ULONG TlsExpansionBitmapBits[32];   // TLS_EXPANSION_SLOTS bits
+-
+-    //
+-    // Id of the Hydra session in which this process is running
+-    //
+-    ULONG SessionId;
+-
+-    //
+-    // Filled in by LdrpInstallAppcompatBackend
+-    //
+-    ULARGE_INTEGER AppCompatFlags;
+-
+-    //
+-    // ntuser appcompat flags
+-    //
+-    ULARGE_INTEGER AppCompatFlagsUser;
+-
+-    //
+-    // Filled in by LdrpInstallAppcompatBackend
+-    //
+-    PEBTEB_POINTER(PVOID) pShimData;
+-
+-    //
+-    // Filled in by LdrQueryImageFileExecutionOptions
+-    //
+-    PEBTEB_POINTER(PVOID) AppCompatInfo;
+-
+-    //
+-    // Used by GetVersionExW as the szCSDVersion string
+-    //
+-    PEBTEB_STRUCT(UNICODE_STRING) CSDVersion;
+-
+-    //
+-    // Fusion stuff
+-    //
+-    PEBTEB_POINTER(const struct _ACTIVATION_CONTEXT_DATA *) ActivationContextData;
+-    PEBTEB_POINTER(struct _ASSEMBLY_STORAGE_MAP *) ProcessAssemblyStorageMap;
+-    PEBTEB_POINTER(const struct _ACTIVATION_CONTEXT_DATA *) SystemDefaultActivationContextData;
+-    PEBTEB_POINTER(struct _ASSEMBLY_STORAGE_MAP *) SystemAssemblyStorageMap;
+-    
+-    //
+-    // Enforced minimum initial commit stack
+-    //
+-    PEBTEB_POINTER(SIZE_T) MinimumStackCommit;
+-
+-    //
+-    // Fiber local storage.
+-    //
+-
+-    PEBTEB_POINTER(PPVOID) FlsCallback;
+-    PEBTEB_STRUCT(LIST_ENTRY) FlsListHead;
+-    PEBTEB_POINTER(PVOID) FlsBitmap;
+-    ULONG FlsBitmapBits[FLS_MAXIMUM_AVAILABLE / (sizeof(ULONG) * 8)];
+-    ULONG FlsHighIndex;
+-} PEBTEB_STRUCT(PEB), * PEBTEB_STRUCT(PPEB);
+-
+-//
+-//  Fusion/sxs thread state information
+-//
+-
+-#define ACTIVATION_CONTEXT_STACK_FLAG_QUERIES_DISABLED (0x00000001)
+-
+-typedef struct PEBTEB_STRUCT(_ACTIVATION_CONTEXT_STACK) {
+-    ULONG Flags;
+-    ULONG NextCookieSequenceNumber;
+-    PEBTEB_POINTER(struct _RTL_ACTIVATION_CONTEXT_STACK_FRAME *) ActiveFrame;
+-    PEBTEB_STRUCT(LIST_ENTRY) FrameListCache;
+-} PEBTEB_STRUCT(ACTIVATION_CONTEXT_STACK), * PEBTEB_STRUCT(PACTIVATION_CONTEXT_STACK);
+-
+-typedef const PEBTEB_STRUCT(ACTIVATION_CONTEXT_STACK) * PEBTEB_STRUCT(PCACTIVATION_CONTEXT_STACK);
+-
+-#define TEB_ACTIVE_FRAME_CONTEXT_FLAG_EXTENDED (0x00000001)
+-
+-typedef struct PEBTEB_STRUCT(_TEB_ACTIVE_FRAME_CONTEXT) {
+-    ULONG Flags;
+-    PEBTEB_POINTER(PCSTR) FrameName;
+-} PEBTEB_STRUCT(TEB_ACTIVE_FRAME_CONTEXT), *PEBTEB_STRUCT(PTEB_ACTIVE_FRAME_CONTEXT);
+-
+-typedef const PEBTEB_STRUCT(TEB_ACTIVE_FRAME_CONTEXT) *PEBTEB_STRUCT(PCTEB_ACTIVE_FRAME_CONTEXT);
+-
+-typedef struct PEBTEB_STRUCT(_TEB_ACTIVE_FRAME_CONTEXT_EX) {
+-    PEBTEB_STRUCT(TEB_ACTIVE_FRAME_CONTEXT) BasicContext;
+-    PEBTEB_POINTER(PCSTR) SourceLocation; // e.g. "Z:\foo\bar\baz.c"
+-} PEBTEB_STRUCT(TEB_ACTIVE_FRAME_CONTEXT_EX), *PEBTEB_STRUCT(PTEB_ACTIVE_FRAME_CONTEXT_EX);
+-
+-typedef const PEBTEB_STRUCT(TEB_ACTIVE_FRAME_CONTEXT_EX) *PEBTEB_STRUCT(PCTEB_ACTIVE_FRAME_CONTEXT_EX);
+-
+-#define TEB_ACTIVE_FRAME_FLAG_EXTENDED (0x00000001)
+-
+-typedef struct PEBTEB_STRUCT(_TEB_ACTIVE_FRAME) {
+-    ULONG Flags;
+-    PEBTEB_POINTER(struct _TEB_ACTIVE_FRAME*) Previous;
+-    PEBTEB_POINTER(PCTEB_ACTIVE_FRAME_CONTEXT) Context;
+-} PEBTEB_STRUCT(TEB_ACTIVE_FRAME), *PEBTEB_STRUCT(PTEB_ACTIVE_FRAME);
+-
+-typedef const PEBTEB_STRUCT(TEB_ACTIVE_FRAME) *PEBTEB_STRUCT(PCTEB_ACTIVE_FRAME);
+-
+-typedef struct PEBTEB_STRUCT(_TEB_ACTIVE_FRAME_EX) {
+-    PEBTEB_STRUCT(TEB_ACTIVE_FRAME) BasicFrame;
+-    PEBTEB_POINTER(PVOID) ExtensionIdentifier; // use address of your DLL Main or something unique to your mapping in the address space
+-} PEBTEB_STRUCT(TEB_ACTIVE_FRAME_EX), *PEBTEB_STRUCT(PTEB_ACTIVE_FRAME_EX);
+-
+-typedef const PEBTEB_STRUCT(TEB_ACTIVE_FRAME_EX) *PEBTEB_STRUCT(PCTEB_ACTIVE_FRAME_EX);
+-
+-/* for searching
+-typedef struct _TEB
+-typedef struct _TEB32
+-typedef struct _TEB64
+-*/
+-typedef struct PEBTEB_STRUCT(_TEB) {
+-    PEBTEB_STRUCT(NT_TIB) NtTib;
+-    PEBTEB_POINTER(PVOID) EnvironmentPointer;
+-    PEBTEB_STRUCT(CLIENT_ID) ClientId;
+-    PEBTEB_POINTER(PVOID) ActiveRpcHandle;
+-    PEBTEB_POINTER(PVOID) ThreadLocalStoragePointer;
+-    PEBTEB_POINTER(PPEB) ProcessEnvironmentBlock;
+-    ULONG LastErrorValue;
+-    ULONG CountOfOwnedCriticalSections;
+-    PEBTEB_POINTER(PVOID) CsrClientThread;
+-    PEBTEB_POINTER(PVOID) Win32ThreadInfo;          // PtiCurrent
+-    ULONG User32Reserved[26];       // user32.dll items
+-    ULONG UserReserved[5];          // Winsrv SwitchStack
+-    PEBTEB_POINTER(PVOID) WOW32Reserved;            // used by WOW
+-    LCID CurrentLocale;
+-    ULONG FpSoftwareStatusRegister; // offset known by outsiders!
+-    PEBTEB_POINTER(PVOID) SystemReserved1[54];      // Used by FP emulator
+-    NTSTATUS ExceptionCode;         // for RaiseUserException
+-    PEBTEB_STRUCT(ACTIVATION_CONTEXT_STACK) ActivationContextStack;   // Fusion activation stack
+-    // sizeof(PEBTEB_POINTER(PVOID)) is a way to express processor-dependence, more generally than #ifdef _WIN64
+-    UCHAR SpareBytes1[48 - sizeof(PEBTEB_POINTER(PVOID)) - sizeof(PEBTEB_STRUCT(ACTIVATION_CONTEXT_STACK))];
+-    PEBTEB_STRUCT(GDI_TEB_BATCH) GdiTebBatch;      // Gdi batching
+-    PEBTEB_STRUCT(CLIENT_ID) RealClientId;
+-    PEBTEB_POINTER(HANDLE) GdiCachedProcessHandle;
+-    ULONG GdiClientPID;
+-    ULONG GdiClientTID;
+-    PEBTEB_POINTER(PVOID) GdiThreadLocalInfo;
+-    PEBTEB_POINTER(ULONG_PTR) Win32ClientInfo[WIN32_CLIENT_INFO_LENGTH]; // User32 Client Info
+-    PEBTEB_POINTER(PVOID) glDispatchTable[233];     // OpenGL
+-    PEBTEB_POINTER(ULONG_PTR) glReserved1[29];      // OpenGL
+-    PEBTEB_POINTER(PVOID) glReserved2;              // OpenGL
+-    PEBTEB_POINTER(PVOID) glSectionInfo;            // OpenGL
+-    PEBTEB_POINTER(PVOID) glSection;                // OpenGL
+-    PEBTEB_POINTER(PVOID) glTable;                  // OpenGL
+-    PEBTEB_POINTER(PVOID) glCurrentRC;              // OpenGL
+-    PEBTEB_POINTER(PVOID) glContext;                // OpenGL
+-    ULONG LastStatusValue;
+-    PEBTEB_STRUCT(UNICODE_STRING) StaticUnicodeString;
+-    WCHAR StaticUnicodeBuffer[STATIC_UNICODE_BUFFER_LENGTH];
+-    PEBTEB_POINTER(PVOID) DeallocationStack;
+-    PEBTEB_POINTER(PVOID) TlsSlots[TLS_MINIMUM_AVAILABLE];
+-    PEBTEB_STRUCT(LIST_ENTRY) TlsLinks;
+-    PEBTEB_POINTER(PVOID) Vdm;
+-    PEBTEB_POINTER(PVOID) ReservedForNtRpc;
+-    PEBTEB_POINTER(PVOID) DbgSsReserved[2];
+-    ULONG HardErrorMode;
+-    PEBTEB_POINTER(PVOID) Instrumentation[16];
+-    PEBTEB_POINTER(PVOID) WinSockData;              // WinSock
+-    ULONG GdiBatchCount;
+-    BOOLEAN InDbgPrint;
+-    BOOLEAN FreeStackOnTermination;
+-    BOOLEAN HasFiberData;
+-    BOOLEAN IdealProcessor;
+-    ULONG Spare3;
+-    PEBTEB_POINTER(PVOID) ReservedForPerf;
+-    PEBTEB_POINTER(PVOID) ReservedForOle;
+-    ULONG WaitingOnLoaderLock;
+-    PEBTEB_STRUCT(WX86THREAD) Wx86Thread;
+-    PEBTEB_POINTER(PPVOID) TlsExpansionSlots;
+-#if (defined(_WIN64) && !defined(PEBTEB_BITS)) \
+-    || ((defined(_WIN64) || defined(_X86_)) && defined(PEBTEB_BITS) && PEBTEB_BITS == 64)
+-    //
+-    // These are in native Win64 TEB, Win64 TEB64, and x86 TEB64.
+-    //
+-    PEBTEB_POINTER(PVOID) DeallocationBStore;
+-    PEBTEB_POINTER(PVOID) BStoreLimit;
+-#endif    
+-    LCID ImpersonationLocale;       // Current locale of impersonated user
+-    ULONG IsImpersonating;          // Thread impersonation status
+-    PEBTEB_POINTER(PVOID) NlsCache;                 // NLS thread cache
+-    PEBTEB_POINTER(PVOID) pShimData;                // Per thread data used in the shim
+-    ULONG HeapVirtualAffinity;
+-    PEBTEB_POINTER(HANDLE) CurrentTransactionHandle;// reserved for TxF transaction context
+-    PEBTEB_POINTER(PTEB_ACTIVE_FRAME) ActiveFrame;
+-    PEBTEB_POINTER(PVOID) FlsData;
+-    
+-} PEBTEB_STRUCT(TEB), *PEBTEB_STRUCT(PTEB);
+-
+-#undef PEBTEB_POINTER
+-#undef PEBTEB_STRUCT
+-#undef PEBTEB_PRIVATE_PASTE
+-#undef PEBTEB_PASTE
+-//
+-// Thread Information Classes
+-//
+-
+-typedef enum _THREADINFOCLASS {
+-    ThreadBasicInformation,
+-    ThreadTimes,
+-    ThreadPriority,
+-    ThreadBasePriority,
+-    ThreadAffinityMask,
+-    ThreadImpersonationToken,
+-    ThreadDescriptorTableEntry,
+-    ThreadEnableAlignmentFaultFixup,
+-    ThreadEventPair_Reusable,
+-    ThreadQuerySetWin32StartAddress,
+-    ThreadZeroTlsCell,
+-    ThreadPerformanceCount,
+-    ThreadAmILastThread,
+-    ThreadIdealProcessor,
+-    ThreadPriorityBoost,
+-    ThreadSetTlsArrayAddress,
+-    ThreadIsIoPending,
+-    ThreadHideFromDebugger,
+-    ThreadBreakOnTermination,
+-    MaxThreadInfoClass
+-    } THREADINFOCLASS;
+-//
+-// Basic Thread Information
+-//  NtQueryInformationThread using ThreadBasicInfo
+-//
+-
+-typedef struct _THREAD_BASIC_INFORMATION {
+-    NTSTATUS ExitStatus;
+-    PTEB TebBaseAddress;
+-    CLIENT_ID ClientId;
+-    ULONG_PTR AffinityMask;
+-    KPRIORITY Priority;
+-    LONG BasePriority;
+-} THREAD_BASIC_INFORMATION;
+-typedef THREAD_BASIC_INFORMATION *PTHREAD_BASIC_INFORMATION;
+-
+-#define NtCurrentPeb() (NtCurrentTeb()->ProcessEnvironmentBlock)
+-
+-NTSYSCALLAPI
+-NTSTATUS
+-NTAPI
+-NtOpenThread (
+-    OUT PHANDLE ThreadHandle,
+-    IN ACCESS_MASK DesiredAccess,
+-    IN POBJECT_ATTRIBUTES ObjectAttributes,
+-    IN PCLIENT_ID ClientId OPTIONAL
+-    );
+-
+-NTSYSCALLAPI
+-NTSTATUS
+-NTAPI
+-NtQueryInformationThread(
+-    IN HANDLE ThreadHandle,
+-    IN THREADINFOCLASS ThreadInformationClass,
+-    OUT PVOID ThreadInformation,
+-    IN ULONG ThreadInformationLength,
+-    OUT PULONG ReturnLength OPTIONAL
+-    );
+-
+-//
+-// System Information Classes.
+-//
+-
+-typedef enum _SYSTEM_INFORMATION_CLASS {
+-    SystemBasicInformation,
+-    SystemProcessorInformation,             // obsolete...delete
+-    SystemPerformanceInformation,
+-    SystemTimeOfDayInformation,
+-    SystemPathInformation,
+-    SystemProcessInformation,
+-    SystemCallCountInformation,
+-    SystemDeviceInformation,
+-    SystemProcessorPerformanceInformation,
+-    SystemFlagsInformation,
+-    SystemCallTimeInformation,
+-    SystemModuleInformation,
+-    SystemLocksInformation,
+-    SystemStackTraceInformation,
+-    SystemPagedPoolInformation,
+-    SystemNonPagedPoolInformation,
+-    SystemHandleInformation,
+-    SystemObjectInformation,
+-    SystemPageFileInformation,
+-    SystemVdmInstemulInformation,
+-    SystemVdmBopInformation,
+-    SystemFileCacheInformation,
+-    SystemPoolTagInformation,
+-    SystemInterruptInformation,
+-    SystemDpcBehaviorInformation,
+-    SystemFullMemoryInformation,
+-    SystemLoadGdiDriverInformation,
+-    SystemUnloadGdiDriverInformation,
+-    SystemTimeAdjustmentInformation,
+-    SystemSummaryMemoryInformation,
+-    SystemMirrorMemoryInformation,
+-    SystemPerformanceTraceInformation,
+-    SystemObsolete0,
+-    SystemExceptionInformation,
+-    SystemCrashDumpStateInformation,
+-    SystemKernelDebuggerInformation,
+-    SystemContextSwitchInformation,
+-    SystemRegistryQuotaInformation,
+-    SystemExtendServiceTableInformation,
+-    SystemPrioritySeperation,
+-    SystemVerifierAddDriverInformation,
+-    SystemVerifierRemoveDriverInformation,
+-    SystemProcessorIdleInformation,
+-    SystemLegacyDriverInformation,
+-    SystemCurrentTimeZoneInformation,
+-    SystemLookasideInformation,
+-    SystemTimeSlipNotification,
+-    SystemSessionCreate,
+-    SystemSessionDetach,
+-    SystemSessionInformation,
+-    SystemRangeStartInformation,
+-    SystemVerifierInformation,
+-    SystemVerifierThunkExtend,
+-    SystemSessionProcessInformation,
+-    SystemLoadGdiDriverInSystemSpace,
+-    SystemNumaProcessorMap,
+-    SystemPrefetcherInformation,
+-    SystemExtendedProcessInformation,
+-    SystemRecommendedSharedDataAlignment,
+-    SystemComPlusPackage,
+-    SystemNumaAvailableMemory,
+-    SystemProcessorPowerInformation,
+-    SystemEmulationBasicInformation,
+-    SystemEmulationProcessorInformation,
+-    SystemExtendedHandleInformation,
+-    SystemLostDelayedWriteInformation,
+-    SystemBigPoolInformation,
+-    SystemSessionPoolTagInformation,
+-    SystemSessionMappedViewInformation,
+-    SystemHotpatchInformation,
+-    SystemObjectSecurityMode,
+-    SystemWatchdogTimerHandler,
+-    SystemWatchdogTimerInformation,
+-    SystemLogicalProcessorInformation,
+-    MaxSystemInfoClass  // MaxSystemInfoClass should always be the last enum
+-} SYSTEM_INFORMATION_CLASS;
+-
+-typedef struct _SYSTEM_PROCESS_INFORMATION {
+-    ULONG NextEntryOffset;
+-    ULONG NumberOfThreads;
+-    LARGE_INTEGER SpareLi1;
+-    LARGE_INTEGER SpareLi2;
+-    LARGE_INTEGER SpareLi3;
+-    LARGE_INTEGER CreateTime;
+-    LARGE_INTEGER UserTime;
+-    LARGE_INTEGER KernelTime;
+-    UNICODE_STRING ImageName;
+-    KPRIORITY BasePriority;
+-    HANDLE UniqueProcessId;
+-    HANDLE InheritedFromUniqueProcessId;
+-    ULONG HandleCount;
+-    ULONG SessionId;
+-    ULONG_PTR PageDirectoryBase;
+-    SIZE_T PeakVirtualSize;
+-    SIZE_T VirtualSize;
+-    ULONG PageFaultCount;
+-    SIZE_T PeakWorkingSetSize;
+-    SIZE_T WorkingSetSize;
+-    SIZE_T QuotaPeakPagedPoolUsage;
+-    SIZE_T QuotaPagedPoolUsage;
+-    SIZE_T QuotaPeakNonPagedPoolUsage;
+-    SIZE_T QuotaNonPagedPoolUsage;
+-    SIZE_T PagefileUsage;
+-    SIZE_T PeakPagefileUsage;
+-    SIZE_T PrivatePageCount;
+-    LARGE_INTEGER ReadOperationCount;
+-    LARGE_INTEGER WriteOperationCount;
+-    LARGE_INTEGER OtherOperationCount;
+-    LARGE_INTEGER ReadTransferCount;
+-    LARGE_INTEGER WriteTransferCount;
+-    LARGE_INTEGER OtherTransferCount;
+-} SYSTEM_PROCESS_INFORMATION, *PSYSTEM_PROCESS_INFORMATION;
+-
+-typedef struct _SYSTEM_THREAD_INFORMATION {
+-    LARGE_INTEGER KernelTime;
+-    LARGE_INTEGER UserTime;
+-    LARGE_INTEGER CreateTime;
+-    ULONG WaitTime;
+-    PVOID StartAddress;
+-    CLIENT_ID ClientId;
+-    KPRIORITY Priority;
+-    LONG BasePriority;
+-    ULONG ContextSwitches;
+-    ULONG ThreadState;
+-    ULONG WaitReason;
+-} SYSTEM_THREAD_INFORMATION, *PSYSTEM_THREAD_INFORMATION;
+-
+-NTSYSCALLAPI
+-NTSTATUS
+-NTAPI
+-NtQuerySystemInformation (
+-    IN SYSTEM_INFORMATION_CLASS SystemInformationClass,
+-    OUT PVOID SystemInformation,
+-    IN ULONG SystemInformationLength,
+-    OUT PULONG ReturnLength OPTIONAL
+-    );
+-
+-#ifndef InitializeListHead
+-
+-
+-//
+-//  Doubly-linked list manipulation routines.  Implemented as macros
+-//  but logically these are procedures.
+-//
+-
+-//
+-//  VOID
+-//  InitializeListHead(
+-//      PLIST_ENTRY ListHead
+-//      );
+-//
+-
+-#define InitializeListHead(ListHead) (\
+-    (ListHead)->Flink = (ListHead)->Blink = (ListHead))
+-
+-//
+-//  BOOLEAN
+-//  IsListEmpty(
+-//      PLIST_ENTRY ListHead
+-//      );
+-//
+-
+-#define IsListEmpty(ListHead) \
+-    ((ListHead)->Flink == (ListHead))
+-
+-//
+-//  PLIST_ENTRY
+-//  RemoveHeadList(
+-//      PLIST_ENTRY ListHead
+-//      );
+-//
+-
+-#define RemoveHeadList(ListHead) \
+-    (ListHead)->Flink;\
+-    {RemoveEntryList((ListHead)->Flink)}
+-
+-//
+-//  PLIST_ENTRY
+-//  RemoveTailList(
+-//      PLIST_ENTRY ListHead
+-//      );
+-//
+-
+-#define RemoveTailList(ListHead) \
+-    (ListHead)->Blink;\
+-    {RemoveEntryList((ListHead)->Blink)}
+-
+-//
+-//  VOID
+-//  RemoveEntryList(
+-//      PLIST_ENTRY Entry
+-//      );
+-//
+-
+-#define RemoveEntryList(Entry) {\
+-    PLIST_ENTRY _EX_Blink;\
+-    PLIST_ENTRY _EX_Flink;\
+-    _EX_Flink = (Entry)->Flink;\
+-    _EX_Blink = (Entry)->Blink;\
+-    _EX_Blink->Flink = _EX_Flink;\
+-    _EX_Flink->Blink = _EX_Blink;\
+-    }
+-
+-//
+-//  VOID
+-//  InsertTailList(
+-//      PLIST_ENTRY ListHead,
+-//      PLIST_ENTRY Entry
+-//      );
+-//
+-
+-#define InsertTailList(ListHead,Entry) {\
+-    PLIST_ENTRY _EX_Blink;\
+-    PLIST_ENTRY _EX_ListHead;\
+-    _EX_ListHead = (ListHead);\
+-    _EX_Blink = _EX_ListHead->Blink;\
+-    (Entry)->Flink = _EX_ListHead;\
+-    (Entry)->Blink = _EX_Blink;\
+-    _EX_Blink->Flink = (Entry);\
+-    _EX_ListHead->Blink = (Entry);\
+-    }
+-
+-//
+-//  VOID
+-//  InsertHeadList(
+-//      PLIST_ENTRY ListHead,
+-//      PLIST_ENTRY Entry
+-//      );
+-//
+-
+-#define InsertHeadList(ListHead,Entry) {\
+-    PLIST_ENTRY _EX_Flink;\
+-    PLIST_ENTRY _EX_ListHead;\
+-    _EX_ListHead = (ListHead);\
+-    _EX_Flink = _EX_ListHead->Flink;\
+-    (Entry)->Flink = _EX_Flink;\
+-    (Entry)->Blink = _EX_ListHead;\
+-    _EX_Flink->Blink = (Entry);\
+-    _EX_ListHead->Flink = (Entry);\
+-    }
+-
+-//
+-//
+-//  PSINGLE_LIST_ENTRY
+-//  PopEntryList(
+-//      PSINGLE_LIST_ENTRY ListHead
+-//      );
+-//
+-
+-#define PopEntryList(ListHead) \
+-    (ListHead)->Next;\
+-    {\
+-        PSINGLE_LIST_ENTRY FirstEntry;\
+-        FirstEntry = (ListHead)->Next;\
+-        if (FirstEntry != NULL) {     \
+-            (ListHead)->Next = FirstEntry->Next;\
+-        }                             \
+-    }
+-
+-
+-//
+-//  VOID
+-//  PushEntryList(
+-//      PSINGLE_LIST_ENTRY ListHead,
+-//      PSINGLE_LIST_ENTRY Entry
+-//      );
+-//
+-
+-#define PushEntryList(ListHead,Entry) \
+-    (Entry)->Next = (ListHead)->Next; \
+-    (ListHead)->Next = (Entry)
+-
+-
+-#endif
+-NTSYSAPI
+-PVOID
+-NTAPI
+-RtlAllocateHeap(
+-    IN PVOID HeapHandle,
+-    IN ULONG Flags,
+-    IN SIZE_T Size
+-    );
+-
+-NTSYSAPI
+-BOOLEAN
+-NTAPI
+-RtlFreeHeap(
+-    IN PVOID HeapHandle,
+-    IN ULONG Flags,
+-    IN PVOID BaseAddress
+-    );
+-
+-NTSYSAPI
+-PVOID
+-NTAPI
+-RtlImageDirectoryEntryToData(
+-    PVOID BaseOfImage,
+-    BOOLEAN MappedAsImage,
+-    USHORT DirectoryEntry,
+-    PULONG Size
+-    );
+-
+-#define HEAP_MAKE_TAG_FLAGS( b, o ) ((ULONG)((b) + ((o) << 18)))  // winnt
+-#define RtlProcessHeap() (NtCurrentPeb()->ProcessHeap)
+-
+-#define RTL_HEAP_MAKE_TAG HEAP_MAKE_TAG_FLAGS
+-
+-#define LdrpCallInitRoutine(InitRoutine, DllHandle, Reason, Context)    \
+-    (InitRoutine)((DllHandle), (Reason), (Context))
+-
+-#ifdef __cplusplus
++template <typename T>
++T* FromVa(ULONG_PTR va) {
++  return reinterpret_cast<T*>(va);
+ }
+-#endif
+-
+-ULONG LdrpNumberOfTlsEntries;
+-
+-NTSTATUS
+-LdrpInitializeTls (
+-    VOID
+-    )
+-{
+-    PLDR_DATA_TABLE_ENTRY Entry;
+-    PLIST_ENTRY Head,Next;
+-    PIMAGE_TLS_DIRECTORY TlsImage;
+-    ULONG TlsSize;
+-
+-    //
+-    // Walk through the loaded modules and look for TLS. If we find TLS,
+-    // lock in the module and add to the TLS chain.
+-    //
+-
+-    Head = &NtCurrentPeb()->Ldr->InLoadOrderModuleList;
+-    Next = Head->Flink;
+-
+-    while (Next != Head) {
+ 
+-        Entry = CONTAINING_RECORD(Next, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
+-        Next = Next->Flink;
+-
+-        TlsImage = (PIMAGE_TLS_DIRECTORY)RtlImageDirectoryEntryToData(
+-                           Entry->DllBase,
+-                           TRUE,
+-                           IMAGE_DIRECTORY_ENTRY_TLS,
+-                           &TlsSize);
+-
+-        if (TlsImage &&
+-            TlsImage->AddressOfIndex
+-           ) {
+-            LdrpNumberOfTlsEntries = ( (*(PLONG)TlsImage->AddressOfIndex + 1 > LdrpNumberOfTlsEntries) ? (*(PLONG)TlsImage->AddressOfIndex + 1) : LdrpNumberOfTlsEntries ) ;
+-        }
+-    }
+-
+-    //
+-    // We now have walked through all static DLLs and know
+-    // all DLLs that reference thread local storage. Now we
+-    // just have to allocate the thread local storage for the current
+-    // thread and for all subsequent threads.
+-    //
+-
+-//  return LdrpAllocateTls ();
+-    return STATUS_SUCCESS;
++BYTE* CurrentTeb() {
++  return reinterpret_cast<BYTE*>(NtCurrentTeb());
+ }
+ 
+-
+-NTSTATUS
+-LdrpAllocateTls (
+-    IN PVOID DllBase,
+-    IN PTEB Teb
+-    )
+-{
+-    PVOID *TlsVector;
+-    HANDLE ProcessHeap;
+-    PIMAGE_TLS_DIRECTORY TlsImage;
+-    ULONG TlsSize;
+-
+-    //
+-    // Allocate the array of thread local storage pointers
+-    //
+-
+-        TlsImage = (PIMAGE_TLS_DIRECTORY)RtlImageDirectoryEntryToData(
+-                           DllBase,
+-                           TRUE,
+-                           IMAGE_DIRECTORY_ENTRY_TLS,
+-                           &TlsSize);
+-
+-
+-        if (!Teb)Teb = NtCurrentTeb();
+-        ProcessHeap = Teb->ProcessEnvironmentBlock->ProcessHeap;
+-
+-        TlsVector = (PVOID *)RtlAllocateHeap(ProcessHeap,0,sizeof(PVOID)*LdrpNumberOfTlsEntries);
+-
+-        if (!TlsVector) {
+-            return STATUS_NO_MEMORY;
+-        }
+-        //
+-        // NOTICE-2002/03/14-ELi
+-        // Zero out the new array of pointers, LdrpFreeTls frees the pointers
+-        // if the pointers are non-NULL
+-        //
+-        RtlZeroMemory( TlsVector, sizeof(PVOID)*LdrpNumberOfTlsEntries );
+-
+-            TlsVector[*(PLONG)TlsImage->AddressOfIndex] = RtlAllocateHeap(
+-                                                        ProcessHeap,
+-                                                        0,
+-                                                        TlsImage->EndAddressOfRawData - TlsImage->StartAddressOfRawData
+-                                                        );
+-            if (!TlsVector[*(PLONG)TlsImage->AddressOfIndex] ) {
+-                return STATUS_NO_MEMORY;
+-            }
+-
+-            //
+-            // Do the TLS Callouts
+-            //
+-
+-            RtlCopyMemory (
+-                TlsVector[*(PLONG)TlsImage->AddressOfIndex],
+-                (PVOID)TlsImage->StartAddressOfRawData,
+-                TlsImage->EndAddressOfRawData - TlsImage->StartAddressOfRawData
+-            );
+-            RtlCopyMemory(
+-                TlsVector,
+-                (PVOID)Teb->ThreadLocalStoragePointer,
+-                sizeof(PVOID) * (LdrpNumberOfTlsEntries - 1)
+-                );
+-
+-        Teb->ThreadLocalStoragePointer = TlsVector;
+-    return STATUS_SUCCESS;
++void** volatile* TlsField(BYTE* teb) {
++  return reinterpret_cast<void** volatile*>(teb + kTebTlsOffset);
+ }
+ 
+-VOID
+-LdrpCallTlsInitializers (
+-    IN PVOID DllBase,
+-    IN ULONG Reason
+-    )
+-{
+-    PIMAGE_TLS_DIRECTORY TlsImage;
+-    ULONG TlsSize;
+-    PIMAGE_TLS_CALLBACK *CallBackArray;
+-    PIMAGE_TLS_CALLBACK InitRoutine;
+-
+-    TlsImage = (PIMAGE_TLS_DIRECTORY)RtlImageDirectoryEntryToData(
+-                       DllBase,
+-                       TRUE,
+-                       IMAGE_DIRECTORY_ENTRY_TLS,
+-                       &TlsSize
+-                       );
+-
+-
+-    if (TlsImage) {
++bool NeedsTlsFix() {
++  const BYTE* peb = reinterpret_cast<const BYTE*>(NtCurrentTeb()->ProcessEnvironmentBlock);
++  const ULONG major = *reinterpret_cast<const ULONG*>(peb + kPebOsMajorOffset);
++  const ULONG minor = *reinterpret_cast<const ULONG*>(peb + kPebOsMinorOffset);
++  const USHORT build = *reinterpret_cast<const USHORT*>(peb + kPebOsBuildOffset);
+ 
+-            CallBackArray = (PIMAGE_TLS_CALLBACK *)TlsImage->AddressOfCallBacks;
+-            if ( CallBackArray ) {
+-                while (*CallBackArray) {
++  const bool old_os =
++      major < 6 || (major == 6 && minor == 0 && build < 5360);
++  if (!old_os)
++    return false;
+ 
+-                    InitRoutine = *CallBackArray++;
+-
+-                    LdrpCallInitRoutine(InitRoutine,
+-                                        DllBase,
+-                                        Reason,
+-                                        0);
+-                }
+-            }
+-
+-    }
++  // WerpInitiateRemoteRecovery detection for One Core API Compatibility
++  HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
++  return kernel32 && !GetProcAddress(kernel32, "WerpInitiateRemoteRecovery");
+ }
+ 
+-
+-PVOID NTAPI TlsQuerySystemInformation(_In_ SYSTEM_INFORMATION_CLASS SystemInformationClass, _Out_opt_ LPDWORD ReturnLength)
+-{
+-
+-    if (ReturnLength)
+-        *ReturnLength = 0;
+-
+-    NTSTATUS status;
+-    PVOID buffer = nullptr;
+-    ULONG len = 0;
+-
+-    do {
+-
+-        RtlFreeHeap(RtlProcessHeap(), 0, buffer);
+-        buffer = nullptr;
+-
+-        if (len) {
+-            len *= 2;
+-            buffer = RtlAllocateHeap(RtlProcessHeap(), 0, len);
+-            if (!buffer)
+-                return nullptr;
+-        }
+-
+-        status = NtQuerySystemInformation(SystemInformationClass, buffer, len, &len);
+-        if (NT_SUCCESS(status))
+-            break;
+-    } while (status == STATUS_INFO_LENGTH_MISMATCH);
+-
+-    if (ReturnLength)
+-        *ReturnLength = len;
+-    return buffer;
++const IMAGE_TLS_DIRECTORY* FindTlsDirectory(const void* image) {
++  const BYTE* base = static_cast<const BYTE*>(image);
++  const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
++  if (!base || dos->e_magic != IMAGE_DOS_SIGNATURE)
++    return nullptr;
++  const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
++  if (nt->Signature != IMAGE_NT_SIGNATURE)
++    return nullptr;
++  const IMAGE_DATA_DIRECTORY& dd =
++      nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
++  return dd.VirtualAddress
++             ? reinterpret_cast<const IMAGE_TLS_DIRECTORY*>(base + dd.VirtualAddress)
++             : nullptr;
+ }
+ 
+-VOID TlsFixInAllThread(PVOID DllBase)
+-{
+-
+-    auto pid = NtCurrentTeb()->ClientId.UniqueProcess;
+-    auto p_system_process_info = PSYSTEM_PROCESS_INFORMATION(TlsQuerySystemInformation(SystemProcessInformation, nullptr));
+-    if (!p_system_process_info) {
+-        return;
+-    }
+-
+-    auto p_process_info = p_system_process_info;
+-    while (true) {
+-        if (p_process_info->UniqueProcessId == pid) {
+-            OBJECT_ATTRIBUTES oa{};
+-            InitializeObjectAttributes(&oa, nullptr, 0, nullptr, nullptr);
+-            THREAD_BASIC_INFORMATION tbi{};
+-            NTSTATUS status = 0;
+-            PSYSTEM_THREAD_INFORMATION ThreadInfo = (PSYSTEM_THREAD_INFORMATION)(p_process_info + 1);
+-            for (ULONG i = 0; i < p_process_info->NumberOfThreads; ++i) {
+-                HANDLE hThread = nullptr;
+-                status = NtOpenThread(&hThread, THREAD_QUERY_INFORMATION, &oa, &ThreadInfo[i].ClientId);
+-
+-                if (NT_SUCCESS(status)) {
+-                    status = NtQueryInformationThread(hThread, ThreadBasicInformation, &tbi, sizeof(tbi), nullptr);
+-                    if (NT_SUCCESS(status) && !!tbi.TebBaseAddress->ThreadLocalStoragePointer) {
+-                        LdrpAllocateTls(DllBase, tbi.TebBaseAddress);
+-                    }
+-
+-                    CloseHandle(hThread);
+-                }
+-            }
+-
+-            break;
+-        }
+-
+-        if (!p_process_info->NextEntryOffset)
+-            break;
+-        p_process_info = PSYSTEM_PROCESS_INFORMATION(LPSTR(p_process_info) + p_process_info->NextEntryOffset);
+-    }
++ULONG FirstFreeTlsIndex(const void* self) {
++  ULONG count = 0;
++  const LIST_ENTRY* head =
++      &NtCurrentTeb()->ProcessEnvironmentBlock->Ldr->InMemoryOrderModuleList;
++  for (const LIST_ENTRY* e = head->Flink; e != head; e = e->Flink) {
++    const auto* entry = CONTAINING_RECORD(e, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
++    if (!entry->DllBase || entry->DllBase == self)
++      continue;
++    const IMAGE_TLS_DIRECTORY* dir = FindTlsDirectory(entry->DllBase);
++    if (!dir || !dir->AddressOfIndex)
++      continue;
++    const ULONG used = *FromVa<const ULONG>(static_cast<ULONG_PTR>(dir->AddressOfIndex));
++    if (used + 1 > count)
++      count = used + 1;
++  }
++  return count;
++}
+ 
+-    RtlFreeHeap(RtlProcessHeap(), 0, p_system_process_info);
++void RunTlsCallbacks(PVOID module, DWORD reason) {
++  auto* cb = FromVa<PIMAGE_TLS_CALLBACK>(static_cast<ULONG_PTR>(g_tls_dir->AddressOfCallBacks));
++  for (; cb && *cb; ++cb)
++    (*cb)(module, reason, nullptr);
+ }
+ 
+-static void TLSInit_DllMain_ThreadAttach(PVOID DllBase)
+-{
+-    PPEB Peb;
++bool AllocateTlsFor(BYTE* teb, bool is_current_thread) {
++  void** volatile* field = TlsField(teb);
++  void** old_vec = *field;
++  const HANDLE heap = GetProcessHeap();
++  const ULONG index = g_tls_index;
++
++  SIZE_T old_count = 0;
++  if (old_vec) {
++    const SIZE_T bytes = HeapSize(heap, 0, old_vec);
++    if (bytes == static_cast<SIZE_T>(-1))
++      return false;
++    old_count = bytes / sizeof(void*);
++  }
++  if (old_count > index && old_vec[index])
++    return true;
++
++  const SIZE_T raw_size = static_cast<ULONG_PTR>(g_tls_dir->EndAddressOfRawData) -
++                          static_cast<ULONG_PTR>(g_tls_dir->StartAddressOfRawData);
++  const SIZE_T total = raw_size + g_tls_dir->SizeOfZeroFill;
++  void* block = HeapAlloc(heap, HEAP_ZERO_MEMORY, total ? total : 1);
++  if (!block)
++    return false;
++  CopyMemory(block, FromVa<const void>(static_cast<ULONG_PTR>(g_tls_dir->StartAddressOfRawData)),
++             raw_size);
++
++  if (old_count > index) {
++    InterlockedExchangePointer(reinterpret_cast<PVOID volatile*>(&old_vec[index]), block);
++    return true;
++  }
+ 
+-  if ( DllBase )
+-  {
+-    Peb = NtCurrentPeb();
+-    if ( Peb->OSMajorVersion < 6 )
+-    {
+-        LdrpAllocateTls (DllBase,NULL);
+-    }
++  void** new_vec = static_cast<void**>(
++      HeapAlloc(heap, HEAP_ZERO_MEMORY, (index + 1) * sizeof(void*)));
++  if (!new_vec) {
++    HeapFree(heap, 0, block);
++    return false;
+   }
++  if (old_count)
++    CopyMemory(new_vec, old_vec, old_count * sizeof(void*));
++  new_vec[index] = block;
++  InterlockedExchangePointer(reinterpret_cast<PVOID volatile*>(field), new_vec);
++  if (is_current_thread && old_vec)
++    HeapFree(heap, 0, old_vec);
++  return true;
+ }
+-static void TLSInit_DllMain_ProcessAttach(PVOID DllBase)
+-{
+-    PPEB Peb;
+-    PIMAGE_TLS_DIRECTORY TlsImage;
+-    ULONG TlsSize;
+-
+-  if ( DllBase )
+-  {
+-    Peb = NtCurrentPeb();
+-    if ( Peb->OSMajorVersion < 6 )
+-    {
+-    TlsImage = (PIMAGE_TLS_DIRECTORY)RtlImageDirectoryEntryToData(
+-                       DllBase,
+-                       TRUE,
+-                       IMAGE_DIRECTORY_ENTRY_TLS,
+-                       &TlsSize
+-                       );
+-        if (TlsImage && !*(PLONG)TlsImage->AddressOfIndex) {
+ 
+-            LdrpInitializeTls ();
++void FreeCurrentThreadTls() {
++  void** vec = *TlsField(CurrentTeb());
++  if (!vec)
++    return;
++  const HANDLE heap = GetProcessHeap();
++  const SIZE_T bytes = HeapSize(heap, 0, vec);
++  if (bytes == static_cast<SIZE_T>(-1) || bytes / sizeof(void*) <= g_tls_index)
++    return;
++  void* block = vec[g_tls_index];
++  vec[g_tls_index] = nullptr;
++  if (block)
++    HeapFree(heap, 0, block);
++}
+ 
+-            *(PLONG)TlsImage->AddressOfIndex = LdrpNumberOfTlsEntries++;
+-             LdrpAllocateTls(DllBase, NULL);
++bool TryAllocateTlsFor(BYTE* teb) {
++  __try {
++    return AllocateTlsFor(teb, false);
++  } __except (EXCEPTION_EXECUTE_HANDLER) {
++    return false;
++  }
++}
+ 
+-            LdrpCallTlsInitializers (DllBase, DLL_PROCESS_ATTACH);
+-            TlsFixInAllThread (DllBase);
+-        }
++void AllocateTlsForOtherThreads() {
++  auto query = reinterpret_cast<NtQueryInformationThreadFn>(
++      GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
++  if (!query)
++    return;
++  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
++  if (snapshot == INVALID_HANDLE_VALUE)
++    return;
++
++  const DWORD pid = GetCurrentProcessId();
++  const DWORD tid = GetCurrentThreadId();
++  THREADENTRY32 te = {sizeof(te)};
++  for (BOOL ok = Thread32First(snapshot, &te); ok; ok = Thread32Next(snapshot, &te)) {
++    if (te.th32OwnerProcessID != pid || te.th32ThreadID == tid)
++      continue;
++    HANDLE thread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
++    if (!thread)
++      continue;
++    ThreadBasicInfo info = {};
++    if (query(thread, 0 , &info, sizeof(info), nullptr) >= 0 &&
++        info.exit_status == STILL_ACTIVE && info.teb_base) {
++      TryAllocateTlsFor(static_cast<BYTE*>(info.teb_base));
+     }
++    CloseHandle(thread);
+   }
++  CloseHandle(snapshot);
+ }
+ 
+-extern "C" BOOL WINAPI RawDllMain(HINSTANCE hModule, DWORD  dwReason, LPVOID lpReserved);
++bool OnProcessAttach(HINSTANCE module) {
++  if (!NeedsTlsFix())
++    return true;
++  const IMAGE_TLS_DIRECTORY* dir = FindTlsDirectory(module);
++  if (!dir || !dir->AddressOfIndex)
++    return true;
++  auto* index_ptr = FromVa<volatile ULONG>(static_cast<ULONG_PTR>(dir->AddressOfIndex));
++  if (*index_ptr != 0)
++    return true;
++
++  g_tls_dir = dir;
++  g_tls_index = FirstFreeTlsIndex(module);
++  *index_ptr = g_tls_index;
++
++  if (!AllocateTlsFor(CurrentTeb(), true)) {
++    *index_ptr = 0;
++    return false;
++  }
++  g_tls_active = true;
++  AllocateTlsForOtherThreads();
++  RunTlsCallbacks(module, DLL_PROCESS_ATTACH);
++  return true;
++}
+ 
+-extern "C" BOOL (WINAPI* _pRawDllMain)(HINSTANCE, DWORD, LPVOID) = &RawDllMain;
++}  // namespace
+ 
++extern "C" BOOL WINAPI RawDllMain(HINSTANCE module, DWORD reason, LPVOID reserved);
+ 
+-/***************************************************************************\
+-*
+-* RawDllMain
+-*
+-* RawDllMain() is called after the before CRT has fully ininitialized.
+-*
+-\***************************************************************************/
++extern "C" BOOL (WINAPI* _pRawDllMain)(HINSTANCE, DWORD, LPVOID) = &RawDllMain;
+ 
+-extern "C"
+-BOOL WINAPI
+-RawDllMain(HINSTANCE hModule, DWORD  dwReason, LPVOID lpReserved)
+-{
+-    UNREFERENCED_PARAMETER(hModule);
+-    UNREFERENCED_PARAMETER(lpReserved);
+-    
+-    switch (dwReason)
+-    {
++extern "C" BOOL WINAPI RawDllMain(HINSTANCE module, DWORD reason, LPVOID reserved) {
++  UNREFERENCED_PARAMETER(reserved);
++  switch (reason) {
+     case DLL_PROCESS_ATTACH:
+-        TLSInit_DllMain_ProcessAttach (hModule);
+-        break;
+-        
+-    case DLL_PROCESS_DETACH:
+-        break;
+-
++      return OnProcessAttach(module);
+     case DLL_THREAD_ATTACH:
+-        TLSInit_DllMain_ThreadAttach (hModule);
+-        break;
+-
++      if (g_tls_active && AllocateTlsFor(CurrentTeb(), true))
++        RunTlsCallbacks(module, DLL_THREAD_ATTACH);
++      break;
+     case DLL_THREAD_DETACH:
+-        break;
+-    }
+-
+-    return TRUE;
++      if (g_tls_active) {
++        RunTlsCallbacks(module, DLL_THREAD_DETACH);
++        FreeCurrentThreadTls();
++      }
++      break;
++    case DLL_PROCESS_DETACH:
++      if (g_tls_active) {
++        RunTlsCallbacks(module, DLL_PROCESS_DETACH);
++        g_tls_active = false;
++      }
++      break;
++  }
++  return TRUE;
+ }
++
+ // Custom crash code to get a unique entry in crash reports.
+ NOINLINE static void CrashOnProcessDetach() {
+   *static_cast<volatile int*>(nullptr) = 0x356;
+diff --git a/base/win/nt_status.cc b/base/win/nt_status.cc
+index 4dbeb6208a..8b878d9c89 100644
+--- a/base/win/nt_status.cc
++++ b/base/win/nt_status.cc
+@@ -6,18 +6,29 @@
+ 
+ #include <windows.h>
+ 
+-extern "C" NTSTATUS WINAPI RtlGetLastNtStatus();
+-
+ namespace base {
+ namespace win {
+ 
+ NTSTATUS GetLastNtStatus() {
+-  // This is equivalent to calling NtCurrentTeb() and extracting
+-  // LastStatusValue from the returned _TEB structure, except that the public
+-  // _TEB struct definition does not actually specify the location of the
+-  // LastStatusValue field. We avoid depending on such a definition by
+-  // internally using RtlGetLastNtStatus() from ntdll.dll instead.
+-  return ::RtlGetLastNtStatus();
++  typedef NTSTATUS(WINAPI* RtlGetLastNtStatusFunc)();
++  static RtlGetLastNtStatusFunc rtl_get_last_nt_status =
++      reinterpret_cast<RtlGetLastNtStatusFunc>(
++          ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), "RtlGetLastNtStatus"));
++
++  if (rtl_get_last_nt_status) {
++    return rtl_get_last_nt_status();
++  }
++
++#if defined(_M_IX86)
++  NTSTATUS last_status;
++  __asm {
++    mov eax, fs:[0xBF0]
++    mov last_status, eax
++  }
++  return last_status;
++#else
++  return STATUS_UNSUCCESSFUL;
++#endif
+ }
+ 
+ }  // namespace win
+diff --git a/base/win/registry.cc b/base/win/registry.cc
+index e864232be2..04997b4b9f 100644
+--- a/base/win/registry.cc
++++ b/base/win/registry.cc
+@@ -51,6 +51,31 @@ inline DWORD to_wchar_size(DWORD byte_size) {
+ // Mask to pull WOW64 access flags out of REGSAM access.
+ constexpr REGSAM kWow64AccessMask = KEY_WOW64_32KEY | KEY_WOW64_64KEY;
+ 
++bool IsWindows2000OrOlder() {
++  static const bool is_w2k = []() {
++    OSVERSIONINFOEXW osvi = { sizeof(osvi) };
++    using RtlGetVersionPtr = NTSTATUS(WINAPI*)(POSVERSIONINFOEXW);
++    HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
++    if (ntdll) {
++      auto rtl_get_version = reinterpret_cast<RtlGetVersionPtr>(
++          ::GetProcAddress(ntdll, "RtlGetVersion"));
++      if (rtl_get_version && rtl_get_version(&osvi) == 0) {
++        return (osvi.dwMajorVersion < 5) || 
++               (osvi.dwMajorVersion == 5 && osvi.dwMinorVersion == 0);
++      }
++    }
++    return false;
++  }();
++  return is_w2k;
++}
++
++REGSAM FilterWow64Access(REGSAM access) {
++  if (IsWindows2000OrOlder()) {
++    return access & ~kWow64AccessMask;
++  }
++  return access;
++}
++
+ constexpr DWORD kInvalidIterValue = static_cast<DWORD>(-1);
+ 
+ // Returns true if `key` is a predefined registry handle.
+@@ -168,13 +193,16 @@ LONG RegKey::CreateWithDisposition(HKEY rootkey,
+                                    REGSAM access) {
+   DCHECK(rootkey && subkey && access && disposition);
+   HKEY subhkey = nullptr;
++
++  REGSAM filtered_access = FilterWow64Access(access);
++
+   LONG result =
+       ::RegCreateKeyEx(rootkey, subkey, 0, nullptr, REG_OPTION_NON_VOLATILE,
+-                       access, nullptr, &subhkey, disposition);
++                       filtered_access, nullptr, &subhkey, disposition);
+   if (result == ERROR_SUCCESS) {
+     Close();
+     key_ = subhkey;
+-    wow64access_ = access & kWow64AccessMask;
++    wow64access_ = filtered_access & kWow64AccessMask;
+   }
+ 
+   return result;
+@@ -194,17 +222,19 @@ LONG RegKey::CreateKey(const wchar_t* name, REGSAM access) {
+   // explicitly use the same flag. Otherwise, there can be unexpected
+   // behavior.
+   // http://msdn.microsoft.com/en-us/library/windows/desktop/aa384129.aspx.
+-  if ((access & kWow64AccessMask) != wow64access_) {
++  REGSAM filtered_access = FilterWow64Access(access);
++
++  if ((filtered_access & kWow64AccessMask) != wow64access_ && !IsWindows2000OrOlder()) {
+     NOTREACHED();
+   }
+   HKEY subkey = nullptr;
+   LONG result =
+-      ::RegCreateKeyEx(key_, name, 0, nullptr, REG_OPTION_NON_VOLATILE, access,
+-                       nullptr, &subkey, nullptr);
++      ::RegCreateKeyEx(key_, name, 0, nullptr, REG_OPTION_NON_VOLATILE,
++                       filtered_access, nullptr, &subkey, nullptr);
+   if (result == ERROR_SUCCESS) {
+     Close();
+     key_ = subkey;
+-    wow64access_ = access & kWow64AccessMask;
++    wow64access_ = filtered_access & kWow64AccessMask;
+   }
+ 
+   return result;
+@@ -228,18 +258,20 @@ LONG RegKey::OpenKey(const wchar_t* relative_key_name, REGSAM access) {
+   // explicitly use the same flag. Otherwise, there can be unexpected
+   // behavior.
+   // http://msdn.microsoft.com/en-us/library/windows/desktop/aa384129.aspx.
+-  if ((access & kWow64AccessMask) != wow64access_) {
++  REGSAM filtered_access = FilterWow64Access(access);
++
++  if ((filtered_access & kWow64AccessMask) != wow64access_ && !IsWindows2000OrOlder()) {
+     NOTREACHED();
+   }
+   HKEY subkey = nullptr;
+-  LONG result = ::RegOpenKeyEx(key_, relative_key_name, 0, access, &subkey);
++  LONG result = ::RegOpenKeyEx(key_, relative_key_name, 0, filtered_access, &subkey);
+ 
+   // We have to close the current opened key before replacing it with the new
+   // one.
+   if (result == ERROR_SUCCESS) {
+     Close();
+     key_ = subkey;
+-    wow64access_ = access & kWow64AccessMask;
++    wow64access_ = filtered_access & kWow64AccessMask;
+   }
+   return result;
+ }
+@@ -517,11 +549,13 @@ LONG RegKey::Open(HKEY rootkey,
+   DCHECK(rootkey && subkey && access);
+   HKEY subhkey = nullptr;
+ 
+-  LONG result = ::RegOpenKeyEx(rootkey, subkey, options, access, &subhkey);
++  REGSAM filtered_access = FilterWow64Access(access);
++
++  LONG result = ::RegOpenKeyEx(rootkey, subkey, options, filtered_access, &subhkey);
+   if (result == ERROR_SUCCESS) {
+     Close();
+     key_ = subhkey;
+-    wow64access_ = access & kWow64AccessMask;
++    wow64access_ = filtered_access & kWow64AccessMask;
+   }
+ 
+   return result;
+@@ -647,8 +681,8 @@ void RegistryValueIterator::Initialize(HKEY root_key,
+                                        const wchar_t* folder_key,
+                                        REGSAM wow64access) {
+   DCHECK_EQ(wow64access & ~kWow64AccessMask, static_cast<REGSAM>(0));
+-  LONG result =
+-      ::RegOpenKeyEx(root_key, folder_key, 0, KEY_READ | wow64access, &key_);
++  REGSAM filtered_access = FilterWow64Access(KEY_READ | wow64access);
++  LONG result = ::RegOpenKeyEx(root_key, folder_key, 0, filtered_access, &key_);
+   if (result != ERROR_SUCCESS) {
+     key_ = nullptr;
+   } else {
+@@ -799,8 +833,8 @@ void RegistryKeyIterator::Initialize(HKEY root_key,
+                                      const wchar_t* folder_key,
+                                      REGSAM wow64access) {
+   DCHECK_EQ(wow64access & ~kWow64AccessMask, static_cast<REGSAM>(0));
+-  LONG result =
+-      ::RegOpenKeyEx(root_key, folder_key, 0, KEY_READ | wow64access, &key_);
++  REGSAM filtered_access = FilterWow64Access(KEY_READ | wow64access);
++  LONG result = ::RegOpenKeyEx(root_key, folder_key, 0, filtered_access, &key_);
+   if (result != ERROR_SUCCESS) {
+     key_ = nullptr;
+   } else {
+diff --git a/base/win/scoped_com_initializer.cc b/base/win/scoped_com_initializer.cc
+index 22d1bd5dd1..449d5635e0 100644
+--- a/base/win/scoped_com_initializer.cc
++++ b/base/win/scoped_com_initializer.cc
+@@ -10,6 +10,7 @@
+ 
+ #include "base/check_op.h"
+ #include "base/win/resource_exhaustion.h"
++#include "base/win/windows_version.h"
+ 
+ namespace base {
+ namespace win {
+@@ -50,7 +51,8 @@ void ScopedCOMInitializer::Initialize(COINIT init,
+   DCHECK_CALLED_ON_VALID_THREAD(thread_checker_);
+   // COINIT_DISABLE_OLE1DDE is always added based on:
+   // https://docs.microsoft.com/en-us/windows/desktop/learnwin32/initializing-the-com-library
+-  if (uninitialization == Uninitialization::kBlockPremature) {
++  if (uninitialization == Uninitialization::kBlockPremature &&
++      base::win::GetVersion() > base::win::Version::XP) {
+     com_balancer_ = Microsoft::WRL::Details::Make<internal::ComInitBalancer>(
+         init | COINIT_DISABLE_OLE1DDE);
+   }
+diff --git a/base/win/windows_version.cc b/base/win/windows_version.cc
+index 1bc281b5e5..12107d720a 100644
+--- a/base/win/windows_version.cc
++++ b/base/win/windows_version.cc
+@@ -100,7 +100,7 @@ OSInfo** OSInfo::GetInstanceStorage() {
+ #pragma clang diagnostic pop
+ 
+     DWORD os_type = 0;
+-    if (version_info.dwMajorVersion == 6 || version_info.dwMajorVersion == 10) {
++    if ((version_info.dwMajorVersion == 6 && version_info.dwBuildNumber >= 6000) || version_info.dwMajorVersion == 10) {
+       // Only present on Vista+.
+       GetProductInfoPtr get_product_info =
+           reinterpret_cast<GetProductInfoPtr>(::GetProcAddress(
+@@ -477,6 +477,9 @@ Version OSInfo::MajorMinorBuildToVersion(uint32_t major,
+   if (major == 6) {
+     switch (minor) {
+       case 0:
++        if (build < 5360) {
++          return Version::SERVER_2003;
++        }
+         return Version::VISTA;
+       case 1:
+         return Version::WIN7;
+@@ -489,6 +492,9 @@ Version OSInfo::MajorMinorBuildToVersion(uint32_t major,
+   }
+ 
+   if (major == 5 && minor != 0) {
++    if (minor == 5 || build <= 2542) {
++      return Version::PRE_XP;
++    }
+     // Treat XP Pro x64, Home Server, and Server 2003 R2 as Server 2003.
+     return minor == 1 ? Version::XP : Version::SERVER_2003;
+   }
+diff --git a/build/config/win/BUILD.gn b/build/config/win/BUILD.gn
+index 1908f48fe7..a788a0caff 100644
+--- a/build/config/win/BUILD.gn
++++ b/build/config/win/BUILD.gn
+@@ -222,6 +222,26 @@ config("compiler") {
+     # the source file is a no-op.
+     "/ignore:4221",
+   ]
++
++  if (current_cpu == "x86" && current_os == "win" && current_toolchain == default_toolchain) {
++    configs = [ ":w2k_compat" ]
++  }
++}
++
++config("w2k_compat") {
++  if (current_cpu == "x86" && current_os == "win" && current_toolchain == default_toolchain) {
++    lib_dirs = [ "//base/win/w2kcompat" ]
++    libs = [
++      "wrp_kernel32.lib",
++      "wrp_advapi32.lib",
++      "wrp_iphlpapi.lib",
++      "wrp_psapi.lib",
++      "wrp_winhttp.lib",
++      "wrp_ws2_32.lib",
++      "wrp_wtsapi32.lib",
++      "wrp_ole32.lib",
++    ]
++  }
+ }
+ 
+ # This is included by reference in the //build/config/compiler:runtime_library
+@@ -648,8 +668,8 @@ if (current_cpu == "x64") {
+   # Windows ARM64 requires Windows 10.
+   subsystem_version_suffix = ",10.0"
+ } else {
+-  # 5.01 = Windows XP.
+-  subsystem_version_suffix = ",5.01"
++  # 5.00 = Windows 2000.
++  subsystem_version_suffix = ",5.00"
+ }
+ 
+ config("console") {
+diff --git a/build/toolchain/win/midl.py b/build/toolchain/win/midl.py
+index 370e5addb5..d632e97986 100644
+--- a/build/toolchain/win/midl.py
++++ b/build/toolchain/win/midl.py
+@@ -500,6 +500,9 @@ def main(
+     if returncode != 0:
+         return returncode
+ 
++    for f in os.listdir(midl_output_dir):
++      shutil.copy(os.path.join(midl_output_dir, f), outdir)
++
+     # Now compare the output in midl_output_dir to the copied-over outputs.
+     _, mismatch, errors = filecmp.cmpfiles(
+         midl_output_dir, outdir, common_files
+diff --git a/chrome/app/version_assembly/chrome_exe_manifest.template b/chrome/app/version_assembly/chrome_exe_manifest.template
+index 7c66328e20..c5a6e7a4e6 100644
+--- a/chrome/app/version_assembly/chrome_exe_manifest.template
++++ b/chrome/app/version_assembly/chrome_exe_manifest.template
+@@ -1,10 +1,3 @@
+ <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+ <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+-  <dependency>
+-  <dependentAssembly>
+-    <assemblyIdentity type='win32'
+-      name='@MAJOR@.@MINOR@.@BUILD@.@PATCH@'
+-      version='@MAJOR@.@MINOR@.@BUILD@.@PATCH@' language='*'/>
+-  </dependentAssembly>
+-  </dependency>
+ </assembly>
+\ No newline at end of file
+diff --git a/chrome/browser/chrome_browser_main_win.cc b/chrome/browser/chrome_browser_main_win.cc
+index c28861d9ca..a4e49b93c3 100644
+--- a/chrome/browser/chrome_browser_main_win.cc
++++ b/chrome/browser/chrome_browser_main_win.cc
+@@ -704,14 +704,6 @@ int ChromeBrowserMainPartsWin::PreCreateThreads() {
+ 
+   int rv = ChromeBrowserMainParts::PreCreateThreads();
+ 
+-  // TODO(viettrungluu): why don't we run this earlier?
+-  if (!base::CommandLine::ForCurrentProcess()->HasSwitch(switches::kNoErrorDialogs) &&
+-      base::win::GetVersion() < base::win::Version::XP) {
+-    chrome::ShowWarningMessageBoxSync(
+-        NULL, l10n_util::GetStringUTF16(IDS_PRODUCT_NAME),
+-        l10n_util::GetStringUTF16(IDS_UNSUPPORTED_OS_PRE_WIN_XP));
+-  }
+-
+   return rv;
+ }
+ 
+diff --git a/chrome/browser/download/download_crx_util.cc b/chrome/browser/download/download_crx_util.cc
+index d6c2c8d29f..a6b75c16dc 100644
+--- a/chrome/browser/download/download_crx_util.cc
++++ b/chrome/browser/download/download_crx_util.cc
+@@ -42,7 +42,7 @@ namespace download_crx_util {
+ 
+ namespace {
+ 
+-bool g_allow_offstore_install_for_testing = false;
++bool g_allow_offstore_install_for_testing = true;
+ 
+ // Hold a mock ExtensionInstallPrompt object that will be used when the
+ // download system opens a CRX.
+diff --git a/chrome/browser/history/chrome_history_client.cc b/chrome/browser/history/chrome_history_client.cc
+index 3f706fe228..0025de86df 100644
+--- a/chrome/browser/history/chrome_history_client.cc
++++ b/chrome/browser/history/chrome_history_client.cc
+@@ -51,8 +51,7 @@ void ChromeHistoryClient::OnHistoryServiceCreated(
+ }
+ 
+ bool ChromeHistoryClient::CanDeferBackendInit() const {
+-  return !AfterStartupTaskUtils::IsBrowserStartupComplete() &&
+-         base::FeatureList::IsEnabled(history::kDeferHistoryBackendInit);
++  return false;
+ }
+ 
+ void ChromeHistoryClient::Shutdown() {
+diff --git a/chrome/browser/icon_loader_win.cc b/chrome/browser/icon_loader_win.cc
+index d1de4432bc..ac81f959de 100644
+--- a/chrome/browser/icon_loader_win.cc
++++ b/chrome/browser/icon_loader_win.cc
+@@ -26,6 +26,7 @@
+ #include "ui/gfx/geometry/size.h"
+ #include "ui/gfx/image/image_skia.h"
+ #include "ui/gfx/win/icon_util.h"
++#include "base/win/windows_version.h"
+ 
+ namespace {
+ // Helper class to manage lifetime of icon reader service.
+@@ -187,6 +188,9 @@ gfx::Image GetIconForFileExtension(const std::wstring& group,
+ // static
+ IconLoader::IconGroup IconLoader::GroupForFilepath(
+     const base::FilePath& file_path) {
++  if (base::win::GetVersion() <= base::win::Version::PRE_XP) {
++    return file_path.Extension();
++  }
+   if (file_path.MatchesExtension(L".exe") ||
+       file_path.MatchesExtension(L".dll") ||
+       file_path.MatchesExtension(L".ico")) {
+diff --git a/chrome/browser/password_manager/password_manager_util_win.cc b/chrome/browser/password_manager/password_manager_util_win.cc
+index 19fbcbaabb..abab5c4aa6 100644
+--- a/chrome/browser/password_manager/password_manager_util_win.cc
++++ b/chrome/browser/password_manager/password_manager_util_win.cc
+@@ -343,6 +343,10 @@ bool AuthenticateUserOld(gfx::NativeWindow window,
+     }
+   }
+ 
++  if (base::win::GetVersion() <= base::win::Version::PRE_XP) {
++    return true;
++  }
++
+   // Keep the current account name separate from the editable prompt buffer.
+   username_length = std::size(displayname);
+   if (!GetUserNameEx(NameDisplay, displayname, &username_length)) {
+diff --git a/chrome/browser/platform_util_win.cc b/chrome/browser/platform_util_win.cc
+index a8f0ddab48..8e9fa87b78 100644
+--- a/chrome/browser/platform_util_win.cc
++++ b/chrome/browser/platform_util_win.cc
+@@ -31,6 +31,7 @@
+ #include "content/public/browser/browser_thread.h"
+ #include "ui/base/win/shell.h"
+ #include "url/gurl.h"
++#include "base/win/windows_version.h"
+ 
+ using content::BrowserThread;
+ 
+@@ -41,6 +42,13 @@ namespace {
+ void ShowItemInFolderOnWorkerThread(const base::FilePath& full_path) {
+   base::ScopedBlockingCall scoped_blocking_call(FROM_HERE,
+                                                 base::BlockingType::MAY_BLOCK);
++
++  if (base::win::GetVersion() <= base::win::Version::PRE_XP) {
++    std::wstring parameters = L"/select,\"" + full_path.value() + L"\"";
++    ShellExecuteW(NULL, L"open", L"explorer.exe", parameters.c_str(), NULL, SW_SHOW);
++    return;
++  }
++
+   base::FilePath dir = full_path.DirName().AsEndingWithSeparator();
+   // ParseDisplayName will fail if the directory is "C:", it must be "C:\\".
+   if (dir.empty())
+@@ -171,6 +179,33 @@ void PlatformOpenVerifiedItem(const base::FilePath& path, OpenItemType type) {
+   // May result in an interactive dialog.
+   base::ScopedBlockingCall scoped_blocking_call(FROM_HERE,
+                                                 base::BlockingType::MAY_BLOCK);
++
++  if (base::win::GetVersion() <= base::win::Version::PRE_XP) {
++    if (type == OPEN_FILE) {
++      std::wstring dir_path = path.DirName().value();
++
++      HINSTANCE hInst = ::ShellExecuteW(
++          NULL,
++          NULL,
++          path.value().c_str(),
++          NULL,
++          dir_path.c_str(),
++          SW_SHOWNORMAL);
++
++      ULONG_PTR result = reinterpret_cast<ULONG_PTR>(hInst);
++
++      if (result == SE_ERR_NOASSOC) {
++        std::wstring open_with_cmd = L"shell32.dll,OpenAs_RunDLL " + path.value();
++        ::ShellExecuteW(NULL, L"open", L"rundll32.exe", open_with_cmd.c_str(), NULL, SW_SHOWNORMAL);
++      }
++      
++      return;
++    } else if (type == OPEN_FOLDER) {
++      ::ShellExecuteW(NULL, L"open", path.value().c_str(), NULL, NULL, SW_SHOWNORMAL);
++      return;
++    }
++  }
++
+   switch (type) {
+     case OPEN_FILE:
+       ui::win::OpenFileViaShell(path);
+diff --git a/chrome/browser/resources/settings/settings_page/settings_section.html.ts b/chrome/browser/resources/settings/settings_page/settings_section.html.ts
+index 5bd48e0699..e656356089 100644
+--- a/chrome/browser/resources/settings/settings_page/settings_section.html.ts
++++ b/chrome/browser/resources/settings/settings_page/settings_section.html.ts
+@@ -8,7 +8,9 @@ import type {SettingsSectionElement} from './settings_section.js';
+ 
+ export function getHtml(this: SettingsSectionElement) {
+   return html`<!--_html_template_start_-->
+-<div id="header" ?hidden="${!this.pageTitle && !this.showSendFeedbackButton}">
++<div id="header"
++    ?hidden="${this.settingsRefresh2026Enabled_ && !this.pageTitle &&
++        !this.showSendFeedbackButton}">
+   <h2 id="title" class="title" tabindex="-1"
+       aria-hidden="${this.getTitleHiddenStatus_() || nothing}">
+     ${this.pageTitle}
+diff --git a/chrome/browser/resources/settings/settings_page/settings_section.ts b/chrome/browser/resources/settings/settings_page/settings_section.ts
+index a04bcd35d7..7873222d99 100644
+--- a/chrome/browser/resources/settings/settings_page/settings_section.ts
++++ b/chrome/browser/resources/settings/settings_page/settings_section.ts
+@@ -19,6 +19,8 @@ import '//resources/cr_elements/cr_shared_vars.css.js';
+ 
+ import {CrLitElement, nothing} from '//resources/lit/v3_0/lit.rollup.js';
+ 
++import {loadTimeData} from '../i18n_setup.js';
++
+ import {getCss} from './settings_section.css.js';
+ import {getHtml} from './settings_section.html.js';
+ 
+@@ -48,11 +50,14 @@ export class SettingsSectionElement extends CrLitElement {
+        * that emits a 'send-feedback' event.
+        */
+       showSendFeedbackButton: {type: Boolean},
++      settingsRefresh2026Enabled_: {type: Boolean},
+     };
+   }
+ 
+   accessor pageTitle: string = '';
+   accessor showSendFeedbackButton: boolean = false;
++  protected accessor settingsRefresh2026Enabled_: boolean =
++      loadTimeData.getString('settingsRefresh2026') !== '';
+ 
+   /**
+    * Get the value to which to set the aria-hidden attribute of the section
+diff --git a/chrome/browser/web_applications/chrome_pwa_launcher/BUILD.gn b/chrome/browser/web_applications/chrome_pwa_launcher/BUILD.gn
+index 8a2eca6075..5adefc33ba 100644
+--- a/chrome/browser/web_applications/chrome_pwa_launcher/BUILD.gn
++++ b/chrome/browser/web_applications/chrome_pwa_launcher/BUILD.gn
+@@ -31,6 +31,10 @@ executable("chrome_pwa_launcher") {
+     "//build/config/win:console",
+   ]
+   configs += [ "//build/config/win:windowed" ]
++
++  ldflags = [
++    "/DELAYLOAD:ole32.dll",
++  ]
+ }
+ 
+ source_set("util") {
+diff --git a/chrome/chrome_proxy/BUILD.gn b/chrome/chrome_proxy/BUILD.gn
+index fd19272039..fd48b08791 100644
+--- a/chrome/chrome_proxy/BUILD.gn
++++ b/chrome/chrome_proxy/BUILD.gn
+@@ -28,4 +28,8 @@ executable("chrome_proxy") {
+     "//build/config/win:console",
+   ]
+   configs += [ "//build/config/win:windowed" ]
++
++  ldflags = [
++    "/DELAYLOAD:ole32.dll",
++  ]
+ }
+diff --git a/chrome/installer/mini_installer/BUILD.gn b/chrome/installer/mini_installer/BUILD.gn
+index df9408bb16..0bddced343 100644
+--- a/chrome/installer/mini_installer/BUILD.gn
++++ b/chrome/installer/mini_installer/BUILD.gn
+@@ -198,6 +198,7 @@ action("mini_installer_archive") {
+     "//chrome/common/win:eventlog_provider",
+     "//chrome/installer/setup",
+     "//third_party/icu:icudata",
++    ":copy_additional_dlls",
+   ]
+ 
+   if (enable_hidpi) {
+@@ -387,3 +388,12 @@ if (!(is_component_build && is_debug && target_cpu == "x86") &&
+     ]
+   }
+ }
++
++copy("copy_additional_dlls") {
++  sources = [
++    "//third_party/additional_dlls/DWrite.dll",
++    "//third_party/additional_dlls/dwrwp.dll",
++    "//third_party/additional_dlls/dwrwpcrt.dll",
++  ]
++  outputs = [ "$root_out_dir/{{source_file_part}}" ]
++}
+diff --git a/chrome/installer/mini_installer/chrome.release b/chrome/installer/mini_installer/chrome.release
+index 78f082d24c..4426601940 100644
+--- a/chrome/installer/mini_installer/chrome.release
++++ b/chrome/installer/mini_installer/chrome.release
+@@ -7,6 +7,7 @@
+ # Chrome Application dir entries, sorted alphabetically.
+ #
+ chrome.exe: %(ChromeDir)s\
++chrome_elf.dll: %(ChromeDir)s\
+ chrome_proxy.exe: %(ChromeDir)s\
+ wow_helper.exe: %(ChromeDir)s\
+ #
+@@ -22,12 +23,14 @@ wow_helper.exe: %(ChromeDir)s\
+ chrome.dll: %(VersionDir)s\
+ chrome_100_percent.pak: %(VersionDir)s\
+ chrome_child.dll: %(VersionDir)s\
+-chrome_elf.dll: %(VersionDir)s\
+ chrome_pwa_launcher.exe: %(VersionDir)s\
+ chrome_renderer.dll: %(VersionDir)s\
+ chrome_wer.dll: %(VersionDir)s\
+ d3dcompiler_43.dll: %(VersionDir)s\
+ d3dcompiler_47.dll: %(VersionDir)s\
++DWrite.dll: %(VersionDir)s\
++dwrwp.dll: %(VersionDir)s\
++dwrwpcrt.dll: %(VersionDir)s\
+ eventlog_provider.dll: %(VersionDir)s\
+ icudtl.dat: %(VersionDir)s\
+ libEGL.dll: %(VersionDir)s\
+diff --git a/chrome/installer/setup/BUILD.gn b/chrome/installer/setup/BUILD.gn
+index e7e695f652..364a5135b1 100644
+--- a/chrome/installer/setup/BUILD.gn
++++ b/chrome/installer/setup/BUILD.gn
+@@ -25,6 +25,10 @@ if (is_win) {
+     ]
+     configs += [ "//build/config/win:windowed" ]
+ 
++    ldflags = [
++      "/DELAYLOAD:ole32.dll",
++    ]
++
+     deps = [
+       ":lib",
+       ":setup_exe_version",
+diff --git a/chrome/installer/setup/install.cc b/chrome/installer/setup/install.cc
+index 2c9ac41297..fb8c2c36a7 100644
+--- a/chrome/installer/setup/install.cc
++++ b/chrome/installer/setup/install.cc
+@@ -423,6 +423,22 @@ void RunShortcutCreationInChildProc(
+     const std::optional<const base::FilePath>& prefs_path,
+     InstallShortcutLevel install_level,
+     InstallShortcutOperation install_operation) {
++
++  if (base::win::GetVersion() <= base::win::Version::PRE_XP) {
++    
++    const base::FilePath target_exe =
++        installer_state.target_path().Append(kChromeExe);
++
++    if (prefs_path.has_value()) {
++      InitialPreferences prefs(prefs_path.value());
++      CreateOrUpdateShortcuts(target_exe, prefs, install_level, install_operation);
++    } else {
++      InitialPreferences empty_prefs;
++      CreateOrUpdateShortcuts(target_exe, empty_prefs, install_level, install_operation);
++    }
++    return;
++  }
++
+   base::CommandLine command_line(setup_path);
+   InstallUtil::AppendModeAndChannelSwitches(&command_line);
+   if (installer_state.system_install()) {
+diff --git a/chrome/installer/setup/install_worker.cc b/chrome/installer/setup/install_worker.cc
+index fd41223140..336f8f6065 100644
+--- a/chrome/installer/setup/install_worker.cc
++++ b/chrome/installer/setup/install_worker.cc
+@@ -184,6 +184,9 @@ void AddVersionKeyWorkItems(const InstallParams& install_params,
+ // case.
+ bool AddFirewallRulesCallback(const base::FilePath& chrome_path,
+                               const CallbackWorkItem& work_item) {
++  if (base::win::GetVersion() <= base::win::Version::XP) {
++    return true;
++  }
+   std::unique_ptr<FirewallManager> manager =
+       FirewallManager::Create(chrome_path);
+   if (!manager) {
+@@ -363,6 +366,12 @@ void AddChromeWorkItems(const InstallParams& install_params,
+         WorkItem::MoveTreeOptions{.lenient_deletion = true});
+   }
+ 
++    WorkItem* copy_elf_work_item = install_list->AddCopyTreeWorkItem(
++        src_path.Append(L"chrome_elf.dll"),
++        target_path.Append(L"chrome_elf.dll"),
++        temp_path);
++    copy_elf_work_item->set_best_effort(true);
++
+   // Update the version key now that chrome.exe or new_chrome.exe is in place.
+   AddVersionKeyWorkItems(install_params, install_list);
+ 
+diff --git a/chrome/installer/setup/launch_chrome.cc b/chrome/installer/setup/launch_chrome.cc
+index 858eb502f6..dda99eb0b4 100644
+--- a/chrome/installer/setup/launch_chrome.cc
++++ b/chrome/installer/setup/launch_chrome.cc
+@@ -2,6 +2,8 @@
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
++#include <windows.h>
++
+ #include "chrome/installer/setup/launch_chrome.h"
+ 
+ #include "base/command_line.h"
+@@ -11,6 +13,7 @@
+ #include "base/process/process.h"
+ #include "base/types/expected_macros.h"
+ #include "base/win/elevation_util.h"
++#include "base/win/windows_version.h"
+ #include "chrome/common/chrome_switches.h"
+ #include "chrome/installer/util/util_constants.h"
+ 
+@@ -43,14 +46,33 @@ bool LaunchChromeAndWait(const base::FilePath& application_path,
+   base::CommandLine cmd(application_path.Append(kChromeExe));
+   cmd.AppendArguments(options, false);
+ 
+-  ASSIGN_OR_RETURN(base::Process chrome_handle, base::win::RunDeElevated(cmd),
+-                   [&cmd](DWORD error_code) {
+-                     ::SetLastError(error_code);
+-                     PLOG(ERROR)
+-                         << "Failed to launch: " << cmd.GetCommandLineString();
+-                     return false;
+-                   });
++  base::Process chrome_handle;
++  if (base::win::GetVersion() < base::win::Version::VISTA) {
++    chrome_handle = base::LaunchProcess(cmd, base::LaunchOptions());
++    if (!chrome_handle.IsValid()) {
++      PLOG(ERROR) << "Failed to launch: " << cmd.GetCommandLineString();
++      return false;
++    }
+ 
++    if (::WaitForSingleObject(chrome_handle.Handle(), INFINITE) == WAIT_OBJECT_0) {
++      DWORD code = 0;
++      if (::GetExitCodeProcess(chrome_handle.Handle(), &code)) {
++        if (exit_code)
++          *exit_code = static_cast<int32_t>(code);
++        return true;
++      }
++    }
++    PLOG(ERROR) << "Wait for process exit failed";
++    return false;
++  } else {
++    ASSIGN_OR_RETURN(chrome_handle, base::win::RunDeElevated(cmd),
++                     [&cmd](DWORD error_code) {
++                       ::SetLastError(error_code);
++                       PLOG(ERROR)
++                           << "Failed to launch: " << cmd.GetCommandLineString();
++                       return false;
++                     });
++  }
+   int ret = STILL_ACTIVE;
+   if (!chrome_handle.WaitForExit(&ret)) {
+     PLOG(ERROR) << "Wait for process exit failed";
+diff --git a/chrome/installer/setup/uninstall.cc b/chrome/installer/setup/uninstall.cc
+index 6cb35f832b..0de210425e 100644
+--- a/chrome/installer/setup/uninstall.cc
++++ b/chrome/installer/setup/uninstall.cc
+@@ -1221,9 +1221,14 @@ bool MoveSetupOutOfInstallFolder(const base::FilePath& setup_exe) {
+ 
+   base::FilePath tmp_dir;
+   base::FilePath temp_file;
+-  if (!(::IsUserAnAdmin()
+-            ? base::PathService::Get(base::DIR_SYSTEM_TEMP, &tmp_dir)
+-            : base::PathService::Get(base::DIR_TEMP, &tmp_dir))) {
++
++  if (base::win::GetVersion() <= base::win::Version::XP) {
++    if (!base::PathService::Get(base::DIR_TEMP, &tmp_dir)) {
++      return false;
++    }
++  } else if (!(::IsUserAnAdmin()
++                   ? base::PathService::Get(base::DIR_SYSTEM_TEMP, &tmp_dir)
++                   : base::PathService::Get(base::DIR_TEMP, &tmp_dir))) {
+     NOTREACHED();
+   }
+ 
+diff --git a/chrome/installer/util/create_reg_key_work_item.cc b/chrome/installer/util/create_reg_key_work_item.cc
+index d1d96add91..be5403db1c 100644
+--- a/chrome/installer/util/create_reg_key_work_item.cc
++++ b/chrome/installer/util/create_reg_key_work_item.cc
+@@ -60,7 +60,7 @@ bool CreateRegKeyWorkItem::DoImpl() {
+ 
+     if (LONG result =
+             key.CreateWithDisposition(predefined_root_, key_path.c_str(),
+-                                      &disposition, KEY_READ | wow64_access_);
++                                      &disposition, KEY_READ | KEY_WRITE | wow64_access_);
+         result == ERROR_SUCCESS) {
+       if (disposition == REG_OPENED_EXISTING_KEY) {
+         if (key_created_) {
+diff --git a/chrome/installer/util/html_dialog_impl.cc b/chrome/installer/util/html_dialog_impl.cc
+index 595fd9d6bf..ebaa511eb0 100644
+--- a/chrome/installer/util/html_dialog_impl.cc
++++ b/chrome/installer/util/html_dialog_impl.cc
+@@ -105,8 +105,27 @@ bool HTMLDialogWin::InternalDoDialog(CustomizationCallback* callback,
+   if (!show_html_dialog)
+     return false;
+ 
++  using CreateURLMonikerExFn =
++      HRESULT(WINAPI*)(IMoniker*, LPCWSTR, IMoniker**, DWORD);
++  using CreateURLMonikerFn =
++      HRESULT(WINAPI*)(IMoniker*, LPCWSTR, IMoniker**);
++
++  static const auto create_url_moniker_ex =
++      reinterpret_cast<CreateURLMonikerExFn>(
++          ::GetProcAddress(::GetModuleHandleW(L"urlmon.dll"),
++                           "CreateURLMonikerEx"));
++  static const auto create_url_moniker =
++      reinterpret_cast<CreateURLMonikerFn>(
++          ::GetProcAddress(::GetModuleHandleW(L"urlmon.dll"),
++                           "CreateURLMoniker"));
++
+   IMoniker* url_moniker = nullptr;
+-  ::CreateURLMonikerEx(nullptr, url_.c_str(), &url_moniker, URL_MK_UNIFORM);
++  if (create_url_moniker_ex) {
++    create_url_moniker_ex(nullptr, url_.c_str(), &url_moniker, URL_MK_UNIFORM);
++  } else if (create_url_moniker) {
++    create_url_moniker(nullptr, url_.c_str(), &url_moniker);
++  }
++
+   if (!url_moniker)
+     return false;
+ 
+diff --git a/chrome/installer/util/install_util.cc b/chrome/installer/util/install_util.cc
+index 8be784a8e1..9129b72054 100644
+--- a/chrome/installer/util/install_util.cc
++++ b/chrome/installer/util/install_util.cc
+@@ -246,12 +246,11 @@ base::Version InstallUtil::GetCriticalUpdateVersion() {
+ }
+ 
+ bool InstallUtil::IsOSSupported() {
+-  // We do not support Win2K or older, or XP without service pack 2.
+   VLOG(1) << base::SysInfo::OperatingSystemName() << ' '
+           << base::SysInfo::OperatingSystemVersion();
+   base::win::Version version = base::win::GetVersion();
+-  return (version > base::win::Version::XP) ||
+-      (version == base::win::Version::XP);
++  return (version > base::win::Version::PRE_XP) ||
++      (version == base::win::Version::PRE_XP);
+ }
+ 
+ void InstallUtil::AddInstallerResultItems(bool system_install,
+@@ -415,6 +414,15 @@ void InstallUtil::AppendModeAndChannelSwitches(
+ 
+ // static
+ std::wstring InstallUtil::GetCurrentDate() {
++  if (base::win::GetVersion() <= base::win::Version::PRE_XP) {
++    SYSTEMTIME st = {};
++    GetLocalTime(&st);
++
++    wchar_t date_str[9] = {};
++    int len = swprintf_s(date_str, std::size(date_str), L"%04d%02d%02d",
++                        st.wYear, st.wMonth, st.wDay);
++    return (len > 0) ? std::wstring(date_str, len) : std::wstring();
++  }
+   static const wchar_t kDateFormat[] = L"yyyyMMdd";
+   wchar_t date_str[std::size(kDateFormat)] = {};
+   int len = GetDateFormatW(LOCALE_INVARIANT, 0, nullptr, kDateFormat, date_str,
+diff --git a/components/crash/core/app/crashpad.cc b/components/crash/core/app/crashpad.cc
+index 900b474c08..2d71337f76 100644
+--- a/components/crash/core/app/crashpad.cc
++++ b/components/crash/core/app/crashpad.cc
+@@ -20,6 +20,7 @@
+ #include "base/containers/span.h"
+ #include "base/debug/crash_logging.h"
+ #include "base/debug/dump_without_crashing.h"
++#include "base/files/file_util.h"
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/string_util.h"
+ #include "base/strings/sys_string_conversions.h"
+@@ -79,6 +80,13 @@ bool InitializeCrashpadImpl(bool initial_client,
+   DCHECK(!initialized);
+   initialized = true;
+ 
++  if (!user_data_dir.empty()) {
++    base::FilePath user_data_path = base::FilePath::FromUTF8Unsafe(user_data_dir);
++    if (!base::DirectoryExists(user_data_path)) {
++      (base::CreateDirectory)(user_data_path);
++    }
++  }
++
+   const bool browser_process = process_type.empty();
+ 
+   if (initial_client) {
+diff --git a/components/update_client/background_downloader_win.cc b/components/update_client/background_downloader_win.cc
+index 517cab62f9..c26e6447ce 100644
+--- a/components/update_client/background_downloader_win.cc
++++ b/components/update_client/background_downloader_win.cc
+@@ -39,6 +39,7 @@
+ #include "base/threading/scoped_thread_priority.h"
+ #include "base/win/com_init_util.h"
+ #include "base/win/scoped_co_mem.h"
++#include "base/win/windows_version.h"
+ #include "components/update_client/task_traits.h"
+ #include "components/update_client/update_client_errors.h"
+ #include "components/update_client/update_client_metrics.h"
+@@ -470,6 +471,11 @@ void BackgroundDownloader::BeginDownload(const GURL& url) {
+   DCHECK_CALLED_ON_VALID_SEQUENCE(com_sequence_checker_);
+   CheckIsMta();
+ 
++  if (base::win::GetVersion() <= base::win::Version::PRE_XP) {
++    EndDownload(E_NOTIMPL);
++    return;
++  }
++
+   download_start_time_ = base::TimeTicks::Now();
+   job_stuck_begin_time_ = download_start_time_;
+ 
+diff --git a/content/browser/service_host/utility_sandbox_delegate_win.cc b/content/browser/service_host/utility_sandbox_delegate_win.cc
+index 0755ff47ed..46ee6bcbeb 100644
+--- a/content/browser/service_host/utility_sandbox_delegate_win.cc
++++ b/content/browser/service_host/utility_sandbox_delegate_win.cc
+@@ -380,7 +380,8 @@ bool UtilitySandboxedProcessLauncherDelegate::GetAppContainerId(
+       *appcontainer_id = UtilityAppContainerId(cmd_line_);
+       return true;
+     case sandbox::mojom::Sandbox::kPrintCompositor:
+-      if (base::FeatureList::IsEnabled(
++      if (base::win::GetVersion() >= base::win::Version::WIN10_RS1 &&
++          base::FeatureList::IsEnabled(
+               sandbox::policy::features::kPrintCompositorLPAC)) {
+         *appcontainer_id = UtilityAppContainerId(cmd_line_);
+         return true;
+@@ -523,6 +524,7 @@ bool UtilitySandboxedProcessLauncherDelegate::InitializeConfig(
+   }
+ 
+   if (sandbox_type_ == sandbox::mojom::Sandbox::kPrintCompositor &&
++      base::win::GetVersion() >= base::win::Version::WIN10_RS1 &&
+       base::FeatureList::IsEnabled(
+           sandbox::policy::features::kPrintCompositorLPAC) &&
+       !app_container_disabled_) {
+diff --git a/content/public/common/content_switches.cc b/content/public/common/content_switches.cc
+index f4ee436aa3..13ddb9b3ad 100644
+--- a/content/public/common/content_switches.cc
++++ b/content/public/common/content_switches.cc
+@@ -646,7 +646,7 @@ const char kSharedArrayBufferUnrestrictedAccessAllowed[] =
+ const char kSharedFiles[] = "shared-files";
+ 
+ // Runs the renderer and plugins in the same process as the browser
+-const char kSingleProcess[]                 = "single-process";
++const char kSingleProcess[]                 = "force-single-process";
+ 
+ // Enforces a one-site-per-process security policy:
+ //  * Each renderer process, for its whole lifetime, is dedicated to rendering
+diff --git a/gpu/ipc/service/gpu_init_2.cc b/gpu/ipc/service/gpu_init_2.cc
+index d03146cd17..04402607a9 100644
+--- a/gpu/ipc/service/gpu_init_2.cc
++++ b/gpu/ipc/service/gpu_init_2.cc
+@@ -51,6 +51,7 @@
+ #if BUILDFLAG(IS_WIN)
+ #include "gpu/ipc/service/gpu_init_win.h"
+ #include "ui/gl/direct_composition_support.h"
++#include "base/win/windows_version.h"
+ #endif
+ 
+ #if BUILDFLAG(IS_ANDROID)
+@@ -429,6 +430,19 @@ bool GpuInit2::InitializeAndStartSandbox(
+   LOG(WARNING) << "Starting gpu initialization.";
+ #endif  //  BUILDFLAG(IS_CHROMEOS)
+   gpu_preferences_ = gpu_preferences;
++
++#if BUILDFLAG(IS_WIN)
++  const bool user_has_gl_switch = command_line->HasSwitch(switches::kUseGL);
++  const bool user_has_angle_switch = command_line->HasSwitch(switches::kUseANGLE);
++
++  if (base::win::GetVersion() < base::win::Version::VISTA &&
++      !user_has_gl_switch &&
++      !user_has_angle_switch) {
++    command_line->AppendSwitchASCII(
++        switches::kUseGL, gl::kGLImplementationSwiftShaderForWebGLName);
++  }
++#endif
++
+   InitState state(watchdog_thread_,
+                   IsGpuWatchdogEnabled(gpu_preferences_, *command_line),
+                   gpu_preferences_.watchdog_starts_backgrounded, command_line,
+@@ -593,6 +607,19 @@ void GpuInit2::MaybeFallbackToWarpEarly(const InitState& state) {
+ void GpuInit2::InitializeInProcess(base::CommandLine* command_line,
+                                   const GpuPreferences& gpu_preferences) {
+   gpu_preferences_ = gpu_preferences;
++
++#if BUILDFLAG(IS_WIN)
++  const bool user_has_gl_switch = command_line->HasSwitch(switches::kUseGL);
++  const bool user_has_angle_switch = command_line->HasSwitch(switches::kUseANGLE);
++
++  if (base::win::GetVersion() < base::win::Version::VISTA &&
++      !user_has_gl_switch &&
++      !user_has_angle_switch) {
++    command_line->AppendSwitchASCII(
++        switches::kUseGL, gl::kGLImplementationSwiftShaderForWebGLName);
++  }
++#endif
++
+   init_successful_ = true;
+ 
+ #if BUILDFLAG(IS_ANDROID)
+@@ -796,6 +823,21 @@ bool GpuInit2::InitializeGLBindingsAndDisplay(InitState& state) {
+     state.gl_display = gl::init::InitializeGLNoExtensionsOneOff(
+         /*init_bindings=*/false, gl::GpuPreference::kDefault);
+     if (!state.gl_display) {
++#if BUILDFLAG(IS_WIN)
++      if (base::win::GetVersion() < base::win::Version::VISTA) {
++        VLOG(1) << "gl::init::InitializeGLNoExtensionsOneOff failed";
++        gl::SetGLImplementation(gl::kGLImplementationDisabled);
++        gpu_info_.gl_implementation_parts =
++            gl::GLImplementationParts(gl::kGLImplementationDisabled);
++        gpu_preferences_.gr_context_type = GrContextType::kNone;
++        for (int i = 0; i < NUMBER_OF_GPU_FEATURE_TYPES; ++i) {
++          gpu_feature_info_.status_values[i] = kGpuFeatureStatusDisabled;
++        }
++        state.gl_disabled = true;
++        init_successful_ = true;
++        return true;
++      }
++#endif
+       VLOG(1) << "gl::init::InitializeGLNoExtensionsOneOff failed";
+       return false;
+     }
+diff --git a/infra/archive_config/win-archive-rel.json b/infra/archive_config/win-archive-rel.json
+index 8aaac5fae8..2f95464c67 100644
+--- a/infra/archive_config/win-archive-rel.json
++++ b/infra/archive_config/win-archive-rel.json
+@@ -12,6 +12,9 @@
+                 "chrome_wer.dll",
+                 "D3DCompiler_43.dll",
+                 "D3DCompiler_47.dll",
++                "DWrite.dll",
++                "dwrwp.dll",
++                "dwrwpcrt.dll",
+                 "dxcompiler.dll",
+                 "elevated_tracing_service.exe",
+                 "elevation_service.exe",
+diff --git a/infra/archive_config/win32-archive-rel.json b/infra/archive_config/win32-archive-rel.json
+index 67eda7af6a..8bae72d68c 100644
+--- a/infra/archive_config/win32-archive-rel.json
++++ b/infra/archive_config/win32-archive-rel.json
+@@ -12,6 +12,9 @@
+                 "chrome_wer.dll",
+                 "D3DCompiler_43.dll",
+                 "D3DCompiler_47.dll",
++                "DWrite.dll",
++                "dwrwp.dll",
++                "dwrwpcrt.dll",
+                 "dxcompiler.dll",
+                 "elevated_tracing_service.exe",
+                 "elevation_service.exe",
+diff --git a/mojo/core/platform_handle_in_transit.cc b/mojo/core/platform_handle_in_transit.cc
+index 95ba20cca6..4648fe842c 100644
+--- a/mojo/core/platform_handle_in_transit.cc
++++ b/mojo/core/platform_handle_in_transit.cc
+@@ -20,6 +20,7 @@
+ #include "base/win/scoped_handle.h"
+ #include "base/win/win_util.h"
+ #include "mojo/public/cpp/platform/platform_handle_security_util_win.h"
++#include "base/win/windows_version.h"
+ #endif
+ 
+ namespace mojo {
+@@ -50,6 +51,11 @@ HANDLE TransferHandle(HANDLE handle,
+   }
+ 
+   const DWORD error = ::GetLastError();
++    if (base::win::GetVersion() <= base::win::Version::PRE_XP) {
++    if (error == ERROR_INVALID_HANDLE || error == ERROR_ACCESS_DENIED) {
++        return INVALID_HANDLE_VALUE;
++      }
++    }
+ 
+   // ERROR_ACCESS_DENIED may indicate that the remote process (which could be
+   // either the source or destination process here) is already terminated or has
+diff --git a/sandbox/policy/win/sandbox_win.cc b/sandbox/policy/win/sandbox_win.cc
+index b482b6942b..b85ef538c3 100644
+--- a/sandbox/policy/win/sandbox_win.cc
++++ b/sandbox/policy/win/sandbox_win.cc
+@@ -675,12 +675,13 @@ base::win::ScopedHandle CreateUnsandboxedJob() {
+   if (!job.is_valid()) {
+     return base::win::ScopedHandle();
+   }
+-
+-  JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {};
+-  limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+-  if (!::SetInformationJobObject(job.get(), JobObjectExtendedLimitInformation,
+-                                 &limits, sizeof(limits))) {
+-    return base::win::ScopedHandle();
++  if (base::win::GetVersion() > base::win::Version::PRE_XP) {
++    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {};
++    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
++    if (!::SetInformationJobObject(job.get(), JobObjectExtendedLimitInformation,
++                                   &limits, sizeof(limits))) {
++      return base::win::ScopedHandle();
++    }
+   }
+   return job;
+ }
+diff --git a/sandbox/win/src/job.cc b/sandbox/win/src/job.cc
+index 3a066a1f8a..284dbcca18 100644
+--- a/sandbox/win/src/job.cc
++++ b/sandbox/win/src/job.cc
+@@ -12,6 +12,7 @@
+ 
+ #include "base/win/windows_version.h"
+ #include "sandbox/win/src/security_level.h"
++#include "base/win/windows_version.h"
+ 
+ namespace sandbox {
+ 
+@@ -64,9 +65,10 @@ DWORD Job::Init(JobLevel security_level,
+             JOB_OBJECT_LIMIT_PROCESS_MEMORY;
+         jeli.ProcessMemoryLimit = memory_limit;
+       }
+-
+-      jeli.BasicLimitInformation.LimitFlags |=
+-          JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
++      if (base::win::GetVersion() > base::win::Version::PRE_XP) {
++        jeli.BasicLimitInformation.LimitFlags |=
++            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
++      }
+       break;
+     }
+     case JobLevel::kNone: {
+diff --git a/sandbox/win/src/restricted_token_utils.cc b/sandbox/win/src/restricted_token_utils.cc
+index 8a3abfe606..523977e84c 100644
+--- a/sandbox/win/src/restricted_token_utils.cc
++++ b/sandbox/win/src/restricted_token_utils.cc
+@@ -127,9 +127,16 @@ std::optional<base::win::AccessToken> CreateRestrictedToken(
+         restricted_token.AddRestrictingSidLogonSession();
+       break;
+     case USER_LOCKDOWN:
+-      remove_traverse_privilege = true;
+-      restricted_token.AddUserSidForDenyOnly();
+-      restricted_token.AddRestrictingSid(base::win::WellKnownSid::kNull);
++      if (base::win::GetVersion() <= base::win::Version::PRE_XP) {
++        AddSidException(sid_exceptions, base::win::WellKnownSid::kBuiltinUsers);
++
++        remove_traverse_privilege = true; 
++        restricted_token.AddRestrictingSid(base::win::WellKnownSid::kRestricted);
++      } else {
++        remove_traverse_privilege = true;
++        restricted_token.AddUserSidForDenyOnly();
++        restricted_token.AddRestrictingSid(base::win::WellKnownSid::kNull);
++      }
+       if (unique_restricted_sid) {
+         restricted_token.AddRestrictingSid(*unique_restricted_sid);
+       }
+diff --git a/testing/scripts/common.py b/testing/scripts/common.py
+index 0b8c75eee2..1f56583ded 100644
+--- a/testing/scripts/common.py
++++ b/testing/scripts/common.py
+@@ -82,7 +82,10 @@ def set_lpac_acls(acl_dir, is_test_script=False):
+     return
+   try:
+     existing_acls = subprocess.check_output(
+-      ['icacls', acl_dir], stderr=subprocess.STDOUT, universal_newlines=True
++        ['icacls', acl_dir], 
++        stderr=subprocess.STDOUT, 
++        encoding='mbcs', 
++        errors='replace'
+     )
+   except subprocess.CalledProcessError as e:
+     logging.error('Failed to retrieve existing ACLs for directory %s', acl_dir)
+diff --git a/third_party/blink/renderer/platform/image-decoders/jxl/jxl_image_decoder.cc b/third_party/blink/renderer/platform/image-decoders/jxl/jxl_image_decoder.cc
+index 2ed17f4069..5ac433e988 100644
+--- a/third_party/blink/renderer/platform/image-decoders/jxl/jxl_image_decoder.cc
++++ b/third_party/blink/renderer/platform/image-decoders/jxl/jxl_image_decoder.cc
+@@ -12,6 +12,7 @@
+ #include "base/logging.h"
+ #include "base/metrics/histogram_functions.h"
+ #include "base/no_destructor.h"
++#include "base/synchronization/lock.h"
+ #include "base/numerics/safe_conversions.h"
+ #include "base/time/time.h"
+ #include "base/timer/elapsed_timer.h"
+@@ -59,6 +60,11 @@ skcms_TFType TransferFunctionType(const skia::ColorProfile& profile) {
+   return skcms_TransferFunction_getType(&trfn);
+ }
+ 
++base::Lock& GetJxlRustLock() {
++  static base::NoDestructor<base::Lock> lock;
++  return *lock;
++}
++
+ }  // namespace
+ 
+ JXLImageDecoder::JXLImageDecoder(AlphaOption alpha_option,
+@@ -214,6 +220,7 @@ bool JXLImageDecoder::SetBasicInfo() {
+ // ---------------------------------------------------------------------------
+ 
+ void JXLImageDecoder::ScanFrames() {
++  base::AutoLock auto_lock(GetJxlRustLock());
+   if (Failed()) {
+     return;
+   }
+@@ -436,6 +443,8 @@ void JXLImageDecoder::Decode(wtf_size_t index, bool only_size) {
+     return;
+   }
+ 
++  base::AutoLock auto_lock(GetJxlRustLock());
++
+   // If we have basic image information, it has already been processed by the
+   // frame scanner. Thus, we don't need to do anything else here.
+   // Moreover, if we do *not* have basic info, there is nothing we can do.
+Submodule third_party/cpuinfo/src 177a11762e..861f9b7c68:
+diff --git a/third_party/cpuinfo/src/src/x86/isa.c b/third_party/cpuinfo/src/src/x86/isa.c
+index cd59f64..e883518 100644
+--- a/third_party/cpuinfo/src/src/x86/isa.c
++++ b/third_party/cpuinfo/src/src/x86/isa.c
+@@ -345,18 +345,24 @@ struct cpuinfo_x86_isa cpuinfo_x86_detect_isa(
+ 	} else {
+ 		/* Detect DAZ support from masked MXCSR bits */
+ 		if (isa.sse && isa.fxsave) {
+-			__declspec(align(16)) struct fxsave_region region = {0};
+-#ifdef _MSC_VER
+-			_fxsave(&region);
++			uint8_t buffer[512 + 16];
++			uintptr_t unaligned_addr = (uintptr_t)buffer;
++			uintptr_t aligned_addr = (unaligned_addr + 15) & ~((uintptr_t)15);
++			struct fxsave_region* region = (struct fxsave_region*)aligned_addr;
++
++			memset(region, 0, sizeof(struct fxsave_region));
++
++#if defined(_MSC_VER) || defined(__CLR_VER)
++			__try {
++				_fxsave(region);
++				isa.daz = !!(region->mxcsr_mask & UINT32_C(0x00000040));
++			} __except (1 /* EXCEPTION_EXECUTE_HANDLER */) {
++				isa.daz = false;
++			}
+ #else
+-			__asm__ __volatile__("fxsave %[region];" : [region] "+m"(region));
++			__asm__ __volatile__("fxsave %[region];" : [region] "+m"(*region));
++			isa.daz = !!(region->mxcsr_mask & UINT32_C(0x00000040));
+ #endif
+-
+-			/*
+-			 * Denormals-as-zero (DAZ) flag:
+-			 * - Intel, AMD: MXCSR[bit 6]
+-			 */
+-			isa.daz = !!(region.mxcsr_mask & UINT32_C(0x00000040));
+ 		}
+ 	}
+ #endif
+diff --git a/third_party/crashpad/crashpad/handler/win/crash_report_exception_handler.cc b/third_party/crashpad/crashpad/handler/win/crash_report_exception_handler.cc
+index 84979f1000..77df4163b0 100644
+--- a/third_party/crashpad/crashpad/handler/win/crash_report_exception_handler.cc
++++ b/third_party/crashpad/crashpad/handler/win/crash_report_exception_handler.cc
+@@ -30,6 +30,7 @@
+ #include "util/win/registration_protocol_win.h"
+ #include "util/win/scoped_process_suspend.h"
+ #include "util/win/termination_codes.h"
++#include "base/win/windows_version.h"
+ 
+ namespace crashpad {
+ 
+@@ -55,7 +56,10 @@ unsigned int CrashReportExceptionHandler::ExceptionHandlerServerException(
+     WinVMAddress debug_critical_section_address) {
+   Metrics::ExceptionEncountered();
+ 
+-  ScopedProcessSuspend suspend(process);
++  std::unique_ptr<ScopedProcessSuspend> suspend;
++  if (base::win::GetVersion() > base::win::Version::PRE_XP) {
++    suspend = std::make_unique<ScopedProcessSuspend>(process);
++  }
+ 
+   ProcessSnapshotWin process_snapshot;
+   if (!process_snapshot.Initialize(process,
+diff --git a/third_party/crashpad/crashpad/snapshot/win/exception_snapshot_win.cc b/third_party/crashpad/crashpad/snapshot/win/exception_snapshot_win.cc
+index b8931444ac..b07b0f64a5 100644
+--- a/third_party/crashpad/crashpad/snapshot/win/exception_snapshot_win.cc
++++ b/third_party/crashpad/crashpad/snapshot/win/exception_snapshot_win.cc
+@@ -284,6 +284,44 @@ bool ExceptionSnapshotWin::InitializeFromExceptionPointers(
+     }
+ 
+     native_to_cpu_context(&context_record, &context_, &context_union_);
++
++#if defined(ARCH_CPU_X86)
++    if (exception_code_ == EXCEPTION_ACCESS_VIOLATION &&
++        context_.architecture == kCPUArchitectureX86 &&
++        context_.x86) {
++
++      const bool is_eip_invalid = (context_.x86->eip == 0 || 
++                                   context_.x86->eip < 0x10000 || 
++                                   context_.x86->eip >= 0x7FFF0000);
++
++      if (is_eip_invalid) {
++        uint32_t real_return_address = 0;
++
++        if (context_.x86->ebp > context_.x86->esp && context_.x86->ebp < 0x7FFF0000) {
++          process_reader->Memory()->Read(
++              static_cast<WinVMAddress>(context_.x86->ebp + 4),
++              sizeof(real_return_address),
++              &real_return_address);
++        }
++
++        const auto is_valid_ptr = [](uint32_t addr) {
++          return addr >= 0x10000 && addr < 0x7FFF0000;
++        };
++
++        if (!is_valid_ptr(real_return_address) && context_.x86->esp != 0) {
++          process_reader->Memory()->Read(
++              static_cast<WinVMAddress>(context_.x86->esp),
++              sizeof(real_return_address),
++              &real_return_address);
++        }
++
++        if (is_valid_ptr(real_return_address) && real_return_address != context_.x86->eip) {
++          context_.x86->eip = real_return_address;
++          exception_address_ = real_return_address;
++        }
++      }
++    }
++#endif
+   }
+ 
+   return true;
+diff --git a/third_party/crashpad/crashpad/snapshot/win/process_reader_win.cc b/third_party/crashpad/crashpad/snapshot/win/process_reader_win.cc
+index 59be4cb2c5..d982ee82e8 100644
+--- a/third_party/crashpad/crashpad/snapshot/win/process_reader_win.cc
++++ b/third_party/crashpad/crashpad/snapshot/win/process_reader_win.cc
+@@ -32,6 +32,8 @@
+ #include "util/win/process_structs.h"
+ #include "util/win/scoped_handle.h"
+ #include "util/win/scoped_local_alloc.h"
++#include <tlhelp32.h>
++#include "base/win/windows_version.h"
+ 
+ namespace crashpad {
+ 
+@@ -387,6 +389,83 @@ template <class Traits>
+ void ProcessReaderWin::ReadThreadData(bool is_64_reading_32) {
+   DCHECK(threads_.empty());
+ 
++  if (base::win::GetVersion() <= base::win::Version::PRE_XP) {
++    DWORD target_pid = static_cast<DWORD>(process_info_.ProcessID());
++    if (target_pid == 0)
++      return;
++
++    HANDLE hSnapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
++    if (hSnapshot == INVALID_HANDLE_VALUE)
++      return;
++
++    THREADENTRY32 te;
++	memset(&te, 0, sizeof(te));
++    te.dwSize = sizeof(THREADENTRY32);
++
++    if (::Thread32First(hSnapshot, &te)) {
++      do {
++        if (te.th32OwnerProcessID == target_pid) {
++          DWORD unique_thread_id = te.th32ThreadID;
++
++          ProcessReaderWin::Thread thread;
++          thread.id = static_cast<uint64_t>(unique_thread_id);
++
++          process_types::SYSTEM_THREAD_INFORMATION<Traits> thread_info;
++          memset(&thread_info, 0, sizeof(thread_info));
++          thread_info.ClientId.UniqueProcess = (typename Traits::Pointer)(ULONG_PTR)target_pid;
++          thread_info.ClientId.UniqueThread = (typename Traits::Pointer)(ULONG_PTR)unique_thread_id;
++
++          ScopedKernelHANDLE thread_handle(OpenThread(thread_info));
++          if (!thread_handle.is_valid())
++            continue;
++
++          if (!FillThreadContextAndSuspendCount<Traits>(thread_handle.get(),
++                                                        &thread,
++                                                        suspension_state_,
++                                                        is_64_reading_32)) {
++            continue;
++          }
++
++          thread.priority_class = NORMAL_PRIORITY_CLASS;
++          thread.priority = te.tpBasePri;
++
++          process_types::THREAD_BASIC_INFORMATION<Traits> thread_basic_info;
++          NTSTATUS status = crashpad::NtQueryInformationThread(
++              thread_handle.get(),
++              static_cast<THREADINFOCLASS>(ThreadBasicInformation),
++              &thread_basic_info,
++              sizeof(thread_basic_info),
++              nullptr);
++          if (!NT_SUCCESS(status)) {
++            NTSTATUS_LOG(ERROR, status) << "NtQueryInformationThread";
++            continue;
++          }
++
++          process_types::NT_TIB<Traits> tib;
++          thread.teb_address = thread_basic_info.TebBaseAddress;
++          thread.teb_size = sizeof(process_types::TEB<Traits>);
++          if (process_memory_.Read(thread.teb_address, sizeof(tib), &tib)) {
++            WinVMAddress base = tib.StackBase;
++            WinVMAddress limit = tib.StackLimit;
++
++            thread.stack_region_address = limit;
++            if (limit >= base) {
++              LOG(ERROR) << "invalid stack range: " << base << " - " << limit;
++              thread.stack_region_size = 0;
++            } else {
++              thread.stack_region_size = base - limit;
++            }
++          }
++
++          threads_.push_back(thread);
++        }
++      } while (::Thread32Next(hSnapshot, &te));
++    }
++
++    ::CloseHandle(hSnapshot);
++    return;
++  }
++
+   std::unique_ptr<uint8_t[]> buffer;
+   process_types::SYSTEM_PROCESS_INFORMATION<Traits>* process_information =
+       GetProcessInformation<Traits>(process_, &buffer);
+diff --git a/third_party/crashpad/crashpad/snapshot/win/process_snapshot_win.cc b/third_party/crashpad/crashpad/snapshot/win/process_snapshot_win.cc
+index e9717eddf6..d3f625e186 100644
+--- a/third_party/crashpad/crashpad/snapshot/win/process_snapshot_win.cc
++++ b/third_party/crashpad/crashpad/snapshot/win/process_snapshot_win.cc
+@@ -30,6 +30,29 @@
+ #include "util/misc/time.h"
+ #include "util/win/nt_internals.h"
+ #include "util/win/registration_protocol_win.h"
++#include "base/win/windows_version.h"
++
++namespace {
++
++bool IsXpRtm() {
++  static const bool is_xp_rtm = []() {
++    OSVERSIONINFOEXW osvi = { sizeof(osvi) };
++    using RtlGetVersionPtr = NTSTATUS(WINAPI*)(POSVERSIONINFOEXW);
++    HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
++    if (ntdll) {
++      auto rtl_get_version = reinterpret_cast<RtlGetVersionPtr>(
++          ::GetProcAddress(ntdll, "RtlGetVersion"));
++      if (rtl_get_version && rtl_get_version(&osvi) == 0) {
++        return osvi.dwMajorVersion == 5 && osvi.dwMinorVersion == 1 &&
++               osvi.wServicePackMajor == 0;
++      }
++    }
++    return false;
++  }();
++  return is_xp_rtm;
++}
++
++}  // namespace
+ 
+ namespace crashpad {
+ 
+@@ -269,6 +292,11 @@ void ProcessSnapshotWin::InitializeModules() {
+ }
+ 
+ void ProcessSnapshotWin::InitializeUnloadedModules() {
++
++  if (base::win::GetVersion() <= base::win::Version::PRE_XP || IsXpRtm()) {
++    return;
++  }
++
+   // As documented by https://msdn.microsoft.com/library/cc678403.aspx, we can
+   // retrieve the location for our unload events, and use that address in the
+   // target process. Unfortunately, this of course only works for 64-reading-64
+diff --git a/third_party/crashpad/crashpad/util/win/registration_protocol_win.cc b/third_party/crashpad/crashpad/util/win/registration_protocol_win.cc
+index e8aed10bdf..39f521f228 100644
+--- a/third_party/crashpad/crashpad/util/win/registration_protocol_win.cc
++++ b/third_party/crashpad/crashpad/util/win/registration_protocol_win.cc
+@@ -27,6 +27,7 @@
+ 
+ #include "base/check.h"
+ #include "base/logging.h"
++#include "base/win/windows_version.h"
+ #include "util/win/exception_handler_server.h"
+ #include "util/win/loader_lock.h"
+ #include "util/win/scoped_handle.h"
+@@ -154,7 +155,7 @@ HANDLE CreateNamedPipeInstance(const std::wstring& pipe_name,
+     // Pre-Vista does not have integrity levels.
+       memset(&security_attributes, 0, sizeof(security_attributes));
+       security_attributes.nLength = sizeof(SECURITY_ATTRIBUTES);
+-    if (IsWindowsVistaOrGreater()) {
++    if (base::win::GetVersion() >= base::win::Version::VISTA) {
+       security_attributes.lpSecurityDescriptor =
+           const_cast<void*>(GetSecurityDescriptorForNamedPipeInstance(nullptr));
+     }
+Submodule third_party/perfetto 68ad4dc416..c6c90e19af:
+diff --git a/third_party/perfetto/include/perfetto/tracing/data_source.h b/third_party/perfetto/include/perfetto/tracing/data_source.h
+index 775742f8..a3c7080f 100644
+--- a/third_party/perfetto/include/perfetto/tracing/data_source.h
++++ b/third_party/perfetto/include/perfetto/tracing/data_source.h
+@@ -448,8 +448,23 @@ class DataSource : public DataSourceBase {
+     // - |instances| is re-read with an acquire barrier below if this succeeds.
+     // - The code between this point and the acquire-load is based on static
+     //    storage which has indefinite lifetime.
+-    uint32_t instances = Traits::GetActiveInstances(trace_point_data)
+-                             ->load(std::memory_order_relaxed);
++    uint32_t instances = 0;
++
++#if defined(_WIN32)
++    __try {
++      auto* active_instances_atomic = Traits::GetActiveInstances(trace_point_data);
++      if (active_instances_atomic) {
++        instances = active_instances_atomic->load(std::memory_order_relaxed);
++      }
++    } __except (1 /* EXCEPTION_EXECUTE_HANDLER */) {
++      return;
++    }
++#else
++    auto* active_instances_atomic = Traits::GetActiveInstances(trace_point_data);
++    if (!active_instances_atomic)
++      return;
++    instances = active_instances_atomic->load(std::memory_order_relaxed);
++#endif
+ 
+     // This is the tracing fast-path. Bail out immediately if tracing is not
+     // enabled (or tracing is enabled but not for this data source).
+Submodule third_party/swiftshader f7247d9c24..c7911988da:
+diff --git a/third_party/swiftshader/src/Vulkan/main.cpp b/third_party/swiftshader/src/Vulkan/main.cpp
+index edbbcc6..4a19edc 100644
+--- a/third_party/swiftshader/src/Vulkan/main.cpp
++++ b/third_party/swiftshader/src/Vulkan/main.cpp
+@@ -18,1291 +18,252 @@
+ #	include "resource.h"
+ #	include <windows.h>
+ 
+-#pragma comment(lib, "ntdll.lib")
++#   include <tlhelp32.h>
++#   include <winternl.h>
+ 
+-#ifdef __cplusplus
+-extern "C" {
+-#endif
+-
+-//
+-// Logical Data Type - These are 32-bit logical values.
+-//
+-
+-typedef ULONG LOGICAL;
+-typedef ULONG *PLOGICAL;
+-
+-// begin_ntndis begin_windbgkd
+-//
+-// NTSTATUS
+-//
+-
+-typedef LONG NTSTATUS;
+-/*lint -save -e624 */  // Don't complain about different typedefs.
+-typedef NTSTATUS *PNTSTATUS;
+-/*lint -restore */  // Resume checking for different typedefs.
+-
+-//
+-//  Status values are 32 bit values layed out as follows:
+-//
+-//   3 3 2 2 2 2 2 2 2 2 2 2 1 1 1 1 1 1 1 1 1 1
+-//   1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0
+-//  +---+-+-------------------------+-------------------------------+
+-//  |Sev|C|       Facility          |               Code            |
+-//  +---+-+-------------------------+-------------------------------+
+-//
+-//  where
+-//
+-//      Sev - is the severity code
+-//
+-//          00 - Success
+-//          01 - Informational
+-//          10 - Warning
+-//          11 - Error
+-//
+-//      C - is the Customer code flag
+-//
+-//      Facility - is the facility code
+-//
+-//      Code - is the facility's status code
+-//
+-
+-//
+-// Generic test for success on any status value (non-negative numbers
+-// indicate success).
+-//
+-
+-#define NT_SUCCESS(Status) ((NTSTATUS)(Status) >= 0)
+-
+-//
+-// Unicode strings are counted 16-bit character strings. If they are
+-// NULL terminated, Length does not include trailing NULL.
+-//
+-
+-typedef struct _UNICODE_STRING {
+-    USHORT Length;
+-    USHORT MaximumLength;
+-#ifdef MIDL_PASS
+-    [size_is(MaximumLength / 2), length_is((Length) / 2) ] USHORT * Buffer;
+-#else // MIDL_PASS
+-    PWSTR  Buffer;
+-#endif // MIDL_PASS
+-} UNICODE_STRING;
+-typedef UNICODE_STRING *PUNICODE_STRING;
+-typedef const UNICODE_STRING *PCUNICODE_STRING;
+-#define UNICODE_NULL ((WCHAR)0) // winnt
+-
+-typedef struct _OBJECT_ATTRIBUTES {
+-    ULONG Length;
+-    HANDLE RootDirectory;
+-    PUNICODE_STRING ObjectName;
+-    ULONG Attributes;
+-    PVOID SecurityDescriptor;        // Points to type SECURITY_DESCRIPTOR
+-    PVOID SecurityQualityOfService;  // Points to type SECURITY_QUALITY_OF_SERVICE
+-} OBJECT_ATTRIBUTES;
+-typedef OBJECT_ATTRIBUTES *POBJECT_ATTRIBUTES;
+-typedef CONST OBJECT_ATTRIBUTES *PCOBJECT_ATTRIBUTES;
+-
+-//++
+-//
+-// VOID
+-// InitializeObjectAttributes(
+-//     OUT POBJECT_ATTRIBUTES p,
+-//     IN PUNICODE_STRING n,
+-//     IN ULONG a,
+-//     IN HANDLE r,
+-//     IN PSECURITY_DESCRIPTOR s
+-//     )
+-//
+-//--
+-
+-#define InitializeObjectAttributes( p, n, a, r, s ) { \
+-    (p)->Length = sizeof( OBJECT_ATTRIBUTES );          \
+-    (p)->RootDirectory = r;                             \
+-    (p)->Attributes = a;                                \
+-    (p)->ObjectName = n;                                \
+-    (p)->SecurityDescriptor = s;                        \
+-    (p)->SecurityQualityOfService = NULL;               \
+-    }
+-
+-//
+-// The success status codes 0 - 63 are reserved for wait completion status.
+-// FacilityCodes 0x5 - 0xF have been allocated by various drivers.
+-//
+-#define STATUS_SUCCESS                          ((NTSTATUS)0x00000000L) // ntsubauth
+-
+-//
+-// MessageId: STATUS_INVALID_INFO_CLASS
+-//
+-// MessageText:
+-//
+-//  {Invalid Parameter}
+-//  The specified information class is not a valid information class for the specified object.
+-//
+-#define STATUS_INVALID_INFO_CLASS        ((NTSTATUS)0xC0000003L)    // ntsubauth
+-
+-//
+-// MessageId: STATUS_INFO_LENGTH_MISMATCH
+-//
+-// MessageText:
+-//
+-//  The specified information record length does not match the length required for the specified information class.
+-//
+-#define STATUS_INFO_LENGTH_MISMATCH      ((NTSTATUS)0xC0000004L)
+-
+-//
+-// Thread priority
+-//
+-
+-typedef LONG KPRIORITY;
+-
+-struct _TEB *
+-NtCurrentTeb(void);
+-
+-//
+-// Loader Data Table. Used to track DLLs loaded into an
+-// image.
+-//
+-
+-typedef struct _LDR_DATA_TABLE_ENTRY {
+-    LIST_ENTRY InLoadOrderLinks;
+-    LIST_ENTRY InMemoryOrderLinks;
+-    LIST_ENTRY InInitializationOrderLinks;
+-    PVOID DllBase;
+-    PVOID EntryPoint;
+-    ULONG SizeOfImage;
+-    UNICODE_STRING FullDllName;
+-    UNICODE_STRING BaseDllName;
+-    ULONG Flags;
+-    USHORT LoadCount;
+-    USHORT TlsIndex;
+-    union {
+-        LIST_ENTRY HashLinks;
+-        struct {
+-            PVOID SectionPointer;
+-            ULONG CheckSum;
+-        };
+-    };
+-    union {
+-        struct {
+-            ULONG TimeDateStamp;
+-        };
+-        struct {
+-            PVOID LoadedImports;
+-        };
+-    };
+-    struct _ACTIVATION_CONTEXT * EntryPointActivationContext;
+-    
+-    PVOID PatchInformation; 
+-    
+-} LDR_DATA_TABLE_ENTRY, *PLDR_DATA_TABLE_ENTRY;
+-
+-//
+-// Process Environment Block
+-//
+-#ifdef _MAC
+-#pragma warning( disable : 4121)
+-#endif
+-
+-typedef struct _PEB_LDR_DATA {
+-    ULONG Length;
+-    BOOLEAN Initialized;
+-    HANDLE SsHandle;
+-    LIST_ENTRY InLoadOrderModuleList;
+-    LIST_ENTRY InMemoryOrderModuleList;
+-    LIST_ENTRY InInitializationOrderModuleList;
+-    PVOID EntryInProgress;
+-} PEB_LDR_DATA, *PPEB_LDR_DATA;
+-
+-#ifdef _MAC
+-#pragma warning( default : 4121 )
+-#endif
+-//
+-// Handle tag bits for Peb Stdio File Handles
+-//
+-
+-#define PEB_STDIO_HANDLE_NATIVE     0
+-#define PEB_STDIO_HANDLE_SUBSYS     1
+-#define PEB_STDIO_HANDLE_PM         2
+-#define PEB_STDIO_HANDLE_RESERVED   3
+-
+-#define GDI_HANDLE_BUFFER_SIZE32  34
+-#define GDI_HANDLE_BUFFER_SIZE64  60
+-
+-#if !defined(_IA64_) && !defined(_AMD64_)
+-#define GDI_HANDLE_BUFFER_SIZE      GDI_HANDLE_BUFFER_SIZE32
+-#else
+-#define GDI_HANDLE_BUFFER_SIZE      GDI_HANDLE_BUFFER_SIZE64
+-#endif
+-
+-typedef ULONG GDI_HANDLE_BUFFER32[GDI_HANDLE_BUFFER_SIZE32];
+-typedef ULONG GDI_HANDLE_BUFFER64[GDI_HANDLE_BUFFER_SIZE64];
+-typedef ULONG GDI_HANDLE_BUFFER  [GDI_HANDLE_BUFFER_SIZE  ];
+-
+-#define FOREGROUND_BASE_PRIORITY  9
+-#define NORMAL_BASE_PRIORITY      8
+-
+-typedef struct _PEB_FREE_BLOCK {
+-    struct _PEB_FREE_BLOCK *Next;
+-    ULONG Size;
+-} PEB_FREE_BLOCK, *PPEB_FREE_BLOCK;
+-
+-// begin_ntddk begin_wdm begin_nthal begin_ntifs
+-//
+-// ClientId
+-//
+-
+-typedef struct _CLIENT_ID {
+-    HANDLE UniqueProcess;
+-    HANDLE UniqueThread;
+-} CLIENT_ID;
+-typedef CLIENT_ID *PCLIENT_ID;
+-
+-// end_ntddk end_wdm end_nthal end_ntifs
+-
+-#if !defined(CLIENT_ID64_DEFINED)
+-
+-typedef struct _CLIENT_ID64 {
+-    ULONGLONG  UniqueProcess;
+-    ULONGLONG  UniqueThread;
+-} CLIENT_ID64;
+-
+-typedef CLIENT_ID64 *PCLIENT_ID64;
+-
+-#define CLIENT_ID64_DEFINED
+-
+-#endif
+-
+-#define FLS_MAXIMUM_AVAILABLE 128   // winnt
+-#define TLS_MINIMUM_AVAILABLE 64    // winnt
+-#define TLS_EXPANSION_SLOTS   1024
+-
+-typedef
+-VOID
+-(*PPS_POST_PROCESS_INIT_ROUTINE) (
+-    VOID
+-    );
+-
+-//
+-// Gdi command batching
+-//
+-
+-#define GDI_BATCH_BUFFER_SIZE 310
+-
+-typedef struct _GDI_TEB_BATCH {
+-    ULONG    Offset;
+-    ULONG_PTR HDC;
+-    ULONG    Buffer[GDI_BATCH_BUFFER_SIZE];
+-} GDI_TEB_BATCH,*PGDI_TEB_BATCH;
+-
+-
+-//
+-// Wx86 thread state information
+-//
+-
+-typedef struct _Wx86ThreadState {
+-    PULONG  CallBx86Eip;
+-    PVOID   DeallocationCpu;
+-    BOOLEAN UseKnownWx86Dll;
+-    char    OleStubInvoked;
+-} WX86THREAD, *PWX86THREAD;
+-
+-//
+-//  TEB - The thread environment block
+-//
+-
+-#define STATIC_UNICODE_BUFFER_LENGTH 261
+-#define WIN32_CLIENT_INFO_LENGTH 62
+-
+-#define WIN32_CLIENT_INFO_SPIN_COUNT 1
+-
+-typedef PVOID* PPVOID;
+-
+-#define PEBTEB_PRIVATE_PASTE(x,y)       x##y
+-#define PEBTEB_PASTE(x,y)               PEBTEB_PRIVATE_PASTE(x,y)
+-
+-//
+-// Declare and use regular native types.
+-//
+-#define PEBTEB_POINTER(x) x
+-#define PEBTEB_STRUCT(x)  x
+-
+-/* for searching
+-typedef struct _PEB
+-typedef struct _PEB32
+-typedef struct _PEB64
+-*/
+-typedef struct PEBTEB_STRUCT(_PEB) {
+-    BOOLEAN InheritedAddressSpace;      // These four fields cannot change unless the
+-    BOOLEAN ReadImageFileExecOptions;   //
+-    BOOLEAN BeingDebugged;              //
+-    BOOLEAN SpareBool;                  //
+-    PEBTEB_POINTER(HANDLE) Mutant;      // INITIAL_PEB structure is also updated.
+-
+-    PEBTEB_POINTER(PVOID) ImageBaseAddress;
+-    PEBTEB_POINTER(PPEB_LDR_DATA) Ldr;
+-    PEBTEB_POINTER(struct _RTL_USER_PROCESS_PARAMETERS*) ProcessParameters;
+-    PEBTEB_POINTER(PVOID) SubSystemData;
+-    PEBTEB_POINTER(PVOID) ProcessHeap;
+-    PEBTEB_POINTER(struct _RTL_CRITICAL_SECTION*) FastPebLock;
+-    PEBTEB_POINTER(PVOID) SparePtr1;
+-    PEBTEB_POINTER(PVOID) SparePtr2;
+-    ULONG EnvironmentUpdateCount;
+-    PEBTEB_POINTER(PVOID) KernelCallbackTable;
+-    ULONG SystemReserved[1];
+-
+-    struct {
+-        ULONG ExecuteOptions : 2;
+-        ULONG SpareBits : 30;
+-    };    
+-
+-
+-    PEBTEB_POINTER(PPEB_FREE_BLOCK) FreeList;
+-    ULONG TlsExpansionCounter;
+-    PEBTEB_POINTER(PVOID) TlsBitmap;
+-    ULONG TlsBitmapBits[2];         // TLS_MINIMUM_AVAILABLE bits
+-    PEBTEB_POINTER(PVOID) ReadOnlySharedMemoryBase;
+-    PEBTEB_POINTER(PVOID) ReadOnlySharedMemoryHeap;
+-    PEBTEB_POINTER(PPVOID) ReadOnlyStaticServerData;
+-    PEBTEB_POINTER(PVOID) AnsiCodePageData;
+-    PEBTEB_POINTER(PVOID) OemCodePageData;
+-    PEBTEB_POINTER(PVOID) UnicodeCaseTableData;
+-
+-    //
+-    // Useful information for LdrpInitialize
+-    ULONG NumberOfProcessors;
+-    ULONG NtGlobalFlag;
+-
+-    //
+-    // Passed up from MmCreatePeb from Session Manager registry key
+-    //
+-
+-    LARGE_INTEGER CriticalSectionTimeout;
+-    PEBTEB_POINTER(SIZE_T) HeapSegmentReserve;
+-    PEBTEB_POINTER(SIZE_T) HeapSegmentCommit;
+-    PEBTEB_POINTER(SIZE_T) HeapDeCommitTotalFreeThreshold;
+-    PEBTEB_POINTER(SIZE_T) HeapDeCommitFreeBlockThreshold;
+-
+-    //
+-    // Where heap manager keeps track of all heaps created for a process
+-    // Fields initialized by MmCreatePeb.  ProcessHeaps is initialized
+-    // to point to the first free byte after the PEB and MaximumNumberOfHeaps
+-    // is computed from the page size used to hold the PEB, less the fixed
+-    // size of this data structure.
+-    //
+-
+-    ULONG NumberOfHeaps;
+-    ULONG MaximumNumberOfHeaps;
+-    PEBTEB_POINTER(PPVOID) ProcessHeaps;
+-
+-    //
+-    //
+-    PEBTEB_POINTER(PVOID) GdiSharedHandleTable;
+-    PEBTEB_POINTER(PVOID) ProcessStarterHelper;
+-    ULONG GdiDCAttributeList;
+-    PEBTEB_POINTER(struct _RTL_CRITICAL_SECTION*) LoaderLock;
+-
+-    //
+-    // Following fields filled in by MmCreatePeb from system values and/or
+-    // image header.
+-    //
+-
+-    ULONG OSMajorVersion;
+-    ULONG OSMinorVersion;
+-    USHORT OSBuildNumber;
+-    USHORT OSCSDVersion;
+-    ULONG OSPlatformId;
+-    ULONG ImageSubsystem;
+-    ULONG ImageSubsystemMajorVersion;
+-    ULONG ImageSubsystemMinorVersion;
+-    PEBTEB_POINTER(ULONG_PTR) ImageProcessAffinityMask;
+-    PEBTEB_STRUCT(GDI_HANDLE_BUFFER) GdiHandleBuffer;
+-    PEBTEB_POINTER(PPS_POST_PROCESS_INIT_ROUTINE) PostProcessInitRoutine;
+-
+-    PEBTEB_POINTER(PVOID) TlsExpansionBitmap;
+-    ULONG TlsExpansionBitmapBits[32];   // TLS_EXPANSION_SLOTS bits
+-
+-    //
+-    // Id of the Hydra session in which this process is running
+-    //
+-    ULONG SessionId;
+-
+-    //
+-    // Filled in by LdrpInstallAppcompatBackend
+-    //
+-    ULARGE_INTEGER AppCompatFlags;
+-
+-    //
+-    // ntuser appcompat flags
+-    //
+-    ULARGE_INTEGER AppCompatFlagsUser;
+-
+-    //
+-    // Filled in by LdrpInstallAppcompatBackend
+-    //
+-    PEBTEB_POINTER(PVOID) pShimData;
+-
+-    //
+-    // Filled in by LdrQueryImageFileExecutionOptions
+-    //
+-    PEBTEB_POINTER(PVOID) AppCompatInfo;
+-
+-    //
+-    // Used by GetVersionExW as the szCSDVersion string
+-    //
+-    PEBTEB_STRUCT(UNICODE_STRING) CSDVersion;
+-
+-    //
+-    // Fusion stuff
+-    //
+-    PEBTEB_POINTER(const struct _ACTIVATION_CONTEXT_DATA *) ActivationContextData;
+-    PEBTEB_POINTER(struct _ASSEMBLY_STORAGE_MAP *) ProcessAssemblyStorageMap;
+-    PEBTEB_POINTER(const struct _ACTIVATION_CONTEXT_DATA *) SystemDefaultActivationContextData;
+-    PEBTEB_POINTER(struct _ASSEMBLY_STORAGE_MAP *) SystemAssemblyStorageMap;
+-    
+-    //
+-    // Enforced minimum initial commit stack
+-    //
+-    PEBTEB_POINTER(SIZE_T) MinimumStackCommit;
+-
+-    //
+-    // Fiber local storage.
+-    //
+-
+-    PEBTEB_POINTER(PPVOID) FlsCallback;
+-    PEBTEB_STRUCT(LIST_ENTRY) FlsListHead;
+-    PEBTEB_POINTER(PVOID) FlsBitmap;
+-    ULONG FlsBitmapBits[FLS_MAXIMUM_AVAILABLE / (sizeof(ULONG) * 8)];
+-    ULONG FlsHighIndex;
+-} PEBTEB_STRUCT(PEB), * PEBTEB_STRUCT(PPEB);
+-
+-//
+-//  Fusion/sxs thread state information
+-//
+-
+-#define ACTIVATION_CONTEXT_STACK_FLAG_QUERIES_DISABLED (0x00000001)
+-
+-typedef struct PEBTEB_STRUCT(_ACTIVATION_CONTEXT_STACK) {
+-    ULONG Flags;
+-    ULONG NextCookieSequenceNumber;
+-    PEBTEB_POINTER(struct _RTL_ACTIVATION_CONTEXT_STACK_FRAME *) ActiveFrame;
+-    PEBTEB_STRUCT(LIST_ENTRY) FrameListCache;
+-} PEBTEB_STRUCT(ACTIVATION_CONTEXT_STACK), * PEBTEB_STRUCT(PACTIVATION_CONTEXT_STACK);
+-
+-typedef const PEBTEB_STRUCT(ACTIVATION_CONTEXT_STACK) * PEBTEB_STRUCT(PCACTIVATION_CONTEXT_STACK);
+-
+-#define TEB_ACTIVE_FRAME_CONTEXT_FLAG_EXTENDED (0x00000001)
+-
+-typedef struct PEBTEB_STRUCT(_TEB_ACTIVE_FRAME_CONTEXT) {
+-    ULONG Flags;
+-    PEBTEB_POINTER(PCSTR) FrameName;
+-} PEBTEB_STRUCT(TEB_ACTIVE_FRAME_CONTEXT), *PEBTEB_STRUCT(PTEB_ACTIVE_FRAME_CONTEXT);
+-
+-typedef const PEBTEB_STRUCT(TEB_ACTIVE_FRAME_CONTEXT) *PEBTEB_STRUCT(PCTEB_ACTIVE_FRAME_CONTEXT);
+-
+-typedef struct PEBTEB_STRUCT(_TEB_ACTIVE_FRAME_CONTEXT_EX) {
+-    PEBTEB_STRUCT(TEB_ACTIVE_FRAME_CONTEXT) BasicContext;
+-    PEBTEB_POINTER(PCSTR) SourceLocation; // e.g. "Z:\foo\bar\baz.c"
+-} PEBTEB_STRUCT(TEB_ACTIVE_FRAME_CONTEXT_EX), *PEBTEB_STRUCT(PTEB_ACTIVE_FRAME_CONTEXT_EX);
+-
+-typedef const PEBTEB_STRUCT(TEB_ACTIVE_FRAME_CONTEXT_EX) *PEBTEB_STRUCT(PCTEB_ACTIVE_FRAME_CONTEXT_EX);
+-
+-#define TEB_ACTIVE_FRAME_FLAG_EXTENDED (0x00000001)
+-
+-typedef struct PEBTEB_STRUCT(_TEB_ACTIVE_FRAME) {
+-    ULONG Flags;
+-    PEBTEB_POINTER(struct _TEB_ACTIVE_FRAME*) Previous;
+-    PEBTEB_POINTER(PCTEB_ACTIVE_FRAME_CONTEXT) Context;
+-} PEBTEB_STRUCT(TEB_ACTIVE_FRAME), *PEBTEB_STRUCT(PTEB_ACTIVE_FRAME);
+-
+-typedef const PEBTEB_STRUCT(TEB_ACTIVE_FRAME) *PEBTEB_STRUCT(PCTEB_ACTIVE_FRAME);
+-
+-typedef struct PEBTEB_STRUCT(_TEB_ACTIVE_FRAME_EX) {
+-    PEBTEB_STRUCT(TEB_ACTIVE_FRAME) BasicFrame;
+-    PEBTEB_POINTER(PVOID) ExtensionIdentifier; // use address of your DLL Main or something unique to your mapping in the address space
+-} PEBTEB_STRUCT(TEB_ACTIVE_FRAME_EX), *PEBTEB_STRUCT(PTEB_ACTIVE_FRAME_EX);
++namespace {
+ 
+-typedef const PEBTEB_STRUCT(TEB_ACTIVE_FRAME_EX) *PEBTEB_STRUCT(PCTEB_ACTIVE_FRAME_EX);
++constexpr size_t kTebTlsOffset = sizeof(void*) == 8 ? 0x58 : 0x2C;
+ 
+-/* for searching
+-typedef struct _TEB
+-typedef struct _TEB32
+-typedef struct _TEB64
+-*/
+-typedef struct PEBTEB_STRUCT(_TEB) {
+-    PEBTEB_STRUCT(NT_TIB) NtTib;
+-    PEBTEB_POINTER(PVOID) EnvironmentPointer;
+-    PEBTEB_STRUCT(CLIENT_ID) ClientId;
+-    PEBTEB_POINTER(PVOID) ActiveRpcHandle;
+-    PEBTEB_POINTER(PVOID) ThreadLocalStoragePointer;
+-    PEBTEB_POINTER(PPEB) ProcessEnvironmentBlock;
+-    ULONG LastErrorValue;
+-    ULONG CountOfOwnedCriticalSections;
+-    PEBTEB_POINTER(PVOID) CsrClientThread;
+-    PEBTEB_POINTER(PVOID) Win32ThreadInfo;          // PtiCurrent
+-    ULONG User32Reserved[26];       // user32.dll items
+-    ULONG UserReserved[5];          // Winsrv SwitchStack
+-    PEBTEB_POINTER(PVOID) WOW32Reserved;            // used by WOW
+-    LCID CurrentLocale;
+-    ULONG FpSoftwareStatusRegister; // offset known by outsiders!
+-    PEBTEB_POINTER(PVOID) SystemReserved1[54];      // Used by FP emulator
+-    NTSTATUS ExceptionCode;         // for RaiseUserException
+-    PEBTEB_STRUCT(ACTIVATION_CONTEXT_STACK) ActivationContextStack;   // Fusion activation stack
+-    // sizeof(PEBTEB_POINTER(PVOID)) is a way to express processor-dependence, more generally than #ifdef _WIN64
+-    UCHAR SpareBytes1[48 - sizeof(PEBTEB_POINTER(PVOID)) - sizeof(PEBTEB_STRUCT(ACTIVATION_CONTEXT_STACK))];
+-    PEBTEB_STRUCT(GDI_TEB_BATCH) GdiTebBatch;      // Gdi batching
+-    PEBTEB_STRUCT(CLIENT_ID) RealClientId;
+-    PEBTEB_POINTER(HANDLE) GdiCachedProcessHandle;
+-    ULONG GdiClientPID;
+-    ULONG GdiClientTID;
+-    PEBTEB_POINTER(PVOID) GdiThreadLocalInfo;
+-    PEBTEB_POINTER(ULONG_PTR) Win32ClientInfo[WIN32_CLIENT_INFO_LENGTH]; // User32 Client Info
+-    PEBTEB_POINTER(PVOID) glDispatchTable[233];     // OpenGL
+-    PEBTEB_POINTER(ULONG_PTR) glReserved1[29];      // OpenGL
+-    PEBTEB_POINTER(PVOID) glReserved2;              // OpenGL
+-    PEBTEB_POINTER(PVOID) glSectionInfo;            // OpenGL
+-    PEBTEB_POINTER(PVOID) glSection;                // OpenGL
+-    PEBTEB_POINTER(PVOID) glTable;                  // OpenGL
+-    PEBTEB_POINTER(PVOID) glCurrentRC;              // OpenGL
+-    PEBTEB_POINTER(PVOID) glContext;                // OpenGL
+-    ULONG LastStatusValue;
+-    PEBTEB_STRUCT(UNICODE_STRING) StaticUnicodeString;
+-    WCHAR StaticUnicodeBuffer[STATIC_UNICODE_BUFFER_LENGTH];
+-    PEBTEB_POINTER(PVOID) DeallocationStack;
+-    PEBTEB_POINTER(PVOID) TlsSlots[TLS_MINIMUM_AVAILABLE];
+-    PEBTEB_STRUCT(LIST_ENTRY) TlsLinks;
+-    PEBTEB_POINTER(PVOID) Vdm;
+-    PEBTEB_POINTER(PVOID) ReservedForNtRpc;
+-    PEBTEB_POINTER(PVOID) DbgSsReserved[2];
+-    ULONG HardErrorMode;
+-    PEBTEB_POINTER(PVOID) Instrumentation[16];
+-    PEBTEB_POINTER(PVOID) WinSockData;              // WinSock
+-    ULONG GdiBatchCount;
+-    BOOLEAN InDbgPrint;
+-    BOOLEAN FreeStackOnTermination;
+-    BOOLEAN HasFiberData;
+-    BOOLEAN IdealProcessor;
+-    ULONG Spare3;
+-    PEBTEB_POINTER(PVOID) ReservedForPerf;
+-    PEBTEB_POINTER(PVOID) ReservedForOle;
+-    ULONG WaitingOnLoaderLock;
+-    PEBTEB_STRUCT(WX86THREAD) Wx86Thread;
+-    PEBTEB_POINTER(PPVOID) TlsExpansionSlots;
+-#if (defined(_WIN64) && !defined(PEBTEB_BITS)) \
+-    || ((defined(_WIN64) || defined(_X86_)) && defined(PEBTEB_BITS) && PEBTEB_BITS == 64)
+-    //
+-    // These are in native Win64 TEB, Win64 TEB64, and x86 TEB64.
+-    //
+-    PEBTEB_POINTER(PVOID) DeallocationBStore;
+-    PEBTEB_POINTER(PVOID) BStoreLimit;
+-#endif    
+-    LCID ImpersonationLocale;       // Current locale of impersonated user
+-    ULONG IsImpersonating;          // Thread impersonation status
+-    PEBTEB_POINTER(PVOID) NlsCache;                 // NLS thread cache
+-    PEBTEB_POINTER(PVOID) pShimData;                // Per thread data used in the shim
+-    ULONG HeapVirtualAffinity;
+-    PEBTEB_POINTER(HANDLE) CurrentTransactionHandle;// reserved for TxF transaction context
+-    PEBTEB_POINTER(PTEB_ACTIVE_FRAME) ActiveFrame;
+-    PEBTEB_POINTER(PVOID) FlsData;
+-    
+-} PEBTEB_STRUCT(TEB), *PEBTEB_STRUCT(PTEB);
+-
+-#undef PEBTEB_POINTER
+-#undef PEBTEB_STRUCT
+-#undef PEBTEB_PRIVATE_PASTE
+-#undef PEBTEB_PASTE
+-//
+-// Thread Information Classes
+-//
+-
+-typedef enum _THREADINFOCLASS {
+-    ThreadBasicInformation,
+-    ThreadTimes,
+-    ThreadPriority,
+-    ThreadBasePriority,
+-    ThreadAffinityMask,
+-    ThreadImpersonationToken,
+-    ThreadDescriptorTableEntry,
+-    ThreadEnableAlignmentFaultFixup,
+-    ThreadEventPair_Reusable,
+-    ThreadQuerySetWin32StartAddress,
+-    ThreadZeroTlsCell,
+-    ThreadPerformanceCount,
+-    ThreadAmILastThread,
+-    ThreadIdealProcessor,
+-    ThreadPriorityBoost,
+-    ThreadSetTlsArrayAddress,
+-    ThreadIsIoPending,
+-    ThreadHideFromDebugger,
+-    ThreadBreakOnTermination,
+-    MaxThreadInfoClass
+-    } THREADINFOCLASS;
+-//
+-// Basic Thread Information
+-//  NtQueryInformationThread using ThreadBasicInfo
+-//
+-
+-typedef struct _THREAD_BASIC_INFORMATION {
+-    NTSTATUS ExitStatus;
+-    PTEB TebBaseAddress;
+-    CLIENT_ID ClientId;
+-    ULONG_PTR AffinityMask;
+-    KPRIORITY Priority;
+-    LONG BasePriority;
+-} THREAD_BASIC_INFORMATION;
+-typedef THREAD_BASIC_INFORMATION *PTHREAD_BASIC_INFORMATION;
+-
+-#define NtCurrentPeb() (NtCurrentTeb()->ProcessEnvironmentBlock)
+-
+-NTSYSCALLAPI
+-NTSTATUS
+-NTAPI
+-NtOpenThread (
+-    OUT PHANDLE ThreadHandle,
+-    IN ACCESS_MASK DesiredAccess,
+-    IN POBJECT_ATTRIBUTES ObjectAttributes,
+-    IN PCLIENT_ID ClientId OPTIONAL
+-    );
+-
+-NTSYSCALLAPI
+-NTSTATUS
+-NTAPI
+-NtQueryInformationThread(
+-    IN HANDLE ThreadHandle,
+-    IN THREADINFOCLASS ThreadInformationClass,
+-    OUT PVOID ThreadInformation,
+-    IN ULONG ThreadInformationLength,
+-    OUT PULONG ReturnLength OPTIONAL
+-    );
+-
+-//
+-// System Information Classes.
+-//
+-
+-typedef enum _SYSTEM_INFORMATION_CLASS {
+-    SystemBasicInformation,
+-    SystemProcessorInformation,             // obsolete...delete
+-    SystemPerformanceInformation,
+-    SystemTimeOfDayInformation,
+-    SystemPathInformation,
+-    SystemProcessInformation,
+-    SystemCallCountInformation,
+-    SystemDeviceInformation,
+-    SystemProcessorPerformanceInformation,
+-    SystemFlagsInformation,
+-    SystemCallTimeInformation,
+-    SystemModuleInformation,
+-    SystemLocksInformation,
+-    SystemStackTraceInformation,
+-    SystemPagedPoolInformation,
+-    SystemNonPagedPoolInformation,
+-    SystemHandleInformation,
+-    SystemObjectInformation,
+-    SystemPageFileInformation,
+-    SystemVdmInstemulInformation,
+-    SystemVdmBopInformation,
+-    SystemFileCacheInformation,
+-    SystemPoolTagInformation,
+-    SystemInterruptInformation,
+-    SystemDpcBehaviorInformation,
+-    SystemFullMemoryInformation,
+-    SystemLoadGdiDriverInformation,
+-    SystemUnloadGdiDriverInformation,
+-    SystemTimeAdjustmentInformation,
+-    SystemSummaryMemoryInformation,
+-    SystemMirrorMemoryInformation,
+-    SystemPerformanceTraceInformation,
+-    SystemObsolete0,
+-    SystemExceptionInformation,
+-    SystemCrashDumpStateInformation,
+-    SystemKernelDebuggerInformation,
+-    SystemContextSwitchInformation,
+-    SystemRegistryQuotaInformation,
+-    SystemExtendServiceTableInformation,
+-    SystemPrioritySeperation,
+-    SystemVerifierAddDriverInformation,
+-    SystemVerifierRemoveDriverInformation,
+-    SystemProcessorIdleInformation,
+-    SystemLegacyDriverInformation,
+-    SystemCurrentTimeZoneInformation,
+-    SystemLookasideInformation,
+-    SystemTimeSlipNotification,
+-    SystemSessionCreate,
+-    SystemSessionDetach,
+-    SystemSessionInformation,
+-    SystemRangeStartInformation,
+-    SystemVerifierInformation,
+-    SystemVerifierThunkExtend,
+-    SystemSessionProcessInformation,
+-    SystemLoadGdiDriverInSystemSpace,
+-    SystemNumaProcessorMap,
+-    SystemPrefetcherInformation,
+-    SystemExtendedProcessInformation,
+-    SystemRecommendedSharedDataAlignment,
+-    SystemComPlusPackage,
+-    SystemNumaAvailableMemory,
+-    SystemProcessorPowerInformation,
+-    SystemEmulationBasicInformation,
+-    SystemEmulationProcessorInformation,
+-    SystemExtendedHandleInformation,
+-    SystemLostDelayedWriteInformation,
+-    SystemBigPoolInformation,
+-    SystemSessionPoolTagInformation,
+-    SystemSessionMappedViewInformation,
+-    SystemHotpatchInformation,
+-    SystemObjectSecurityMode,
+-    SystemWatchdogTimerHandler,
+-    SystemWatchdogTimerInformation,
+-    SystemLogicalProcessorInformation,
+-    MaxSystemInfoClass  // MaxSystemInfoClass should always be the last enum
+-} SYSTEM_INFORMATION_CLASS;
+-
+-typedef struct _SYSTEM_PROCESS_INFORMATION {
+-    ULONG NextEntryOffset;
+-    ULONG NumberOfThreads;
+-    LARGE_INTEGER SpareLi1;
+-    LARGE_INTEGER SpareLi2;
+-    LARGE_INTEGER SpareLi3;
+-    LARGE_INTEGER CreateTime;
+-    LARGE_INTEGER UserTime;
+-    LARGE_INTEGER KernelTime;
+-    UNICODE_STRING ImageName;
+-    KPRIORITY BasePriority;
+-    HANDLE UniqueProcessId;
+-    HANDLE InheritedFromUniqueProcessId;
+-    ULONG HandleCount;
+-    ULONG SessionId;
+-    ULONG_PTR PageDirectoryBase;
+-    SIZE_T PeakVirtualSize;
+-    SIZE_T VirtualSize;
+-    ULONG PageFaultCount;
+-    SIZE_T PeakWorkingSetSize;
+-    SIZE_T WorkingSetSize;
+-    SIZE_T QuotaPeakPagedPoolUsage;
+-    SIZE_T QuotaPagedPoolUsage;
+-    SIZE_T QuotaPeakNonPagedPoolUsage;
+-    SIZE_T QuotaNonPagedPoolUsage;
+-    SIZE_T PagefileUsage;
+-    SIZE_T PeakPagefileUsage;
+-    SIZE_T PrivatePageCount;
+-    LARGE_INTEGER ReadOperationCount;
+-    LARGE_INTEGER WriteOperationCount;
+-    LARGE_INTEGER OtherOperationCount;
+-    LARGE_INTEGER ReadTransferCount;
+-    LARGE_INTEGER WriteTransferCount;
+-    LARGE_INTEGER OtherTransferCount;
+-} SYSTEM_PROCESS_INFORMATION, *PSYSTEM_PROCESS_INFORMATION;
+-
+-typedef struct _SYSTEM_THREAD_INFORMATION {
+-    LARGE_INTEGER KernelTime;
+-    LARGE_INTEGER UserTime;
+-    LARGE_INTEGER CreateTime;
+-    ULONG WaitTime;
+-    PVOID StartAddress;
+-    CLIENT_ID ClientId;
+-    KPRIORITY Priority;
+-    LONG BasePriority;
+-    ULONG ContextSwitches;
+-    ULONG ThreadState;
+-    ULONG WaitReason;
+-} SYSTEM_THREAD_INFORMATION, *PSYSTEM_THREAD_INFORMATION;
+-
+-NTSYSCALLAPI
+-NTSTATUS
+-NTAPI
+-NtQuerySystemInformation (
+-    IN SYSTEM_INFORMATION_CLASS SystemInformationClass,
+-    OUT PVOID SystemInformation,
+-    IN ULONG SystemInformationLength,
+-    OUT PULONG ReturnLength OPTIONAL
+-    );
+-
+-#ifndef InitializeListHead
++constexpr size_t kPebOsMajorOffset = sizeof(void*) == 8 ? 0x118 : 0xA4;
++constexpr size_t kPebOsMinorOffset = sizeof(void*) == 8 ? 0x11C : 0xA8;
++constexpr size_t kPebOsBuildOffset = sizeof(void*) == 8 ? 0x120 : 0xAC;
+ 
++struct ThreadBasicInfo {
++  LONG exit_status;
++  PVOID teb_base;
++  PVOID unique_process;
++  PVOID unique_thread;
++  ULONG_PTR affinity_mask;
++  LONG priority;
++  LONG base_priority;
++};
+ 
+-//
+-//  Doubly-linked list manipulation routines.  Implemented as macros
+-//  but logically these are procedures.
+-//
+-
+-//
+-//  VOID
+-//  InitializeListHead(
+-//      PLIST_ENTRY ListHead
+-//      );
+-//
+-
+-#define InitializeListHead(ListHead) (\
+-    (ListHead)->Flink = (ListHead)->Blink = (ListHead))
+-
+-//
+-//  BOOLEAN
+-//  IsListEmpty(
+-//      PLIST_ENTRY ListHead
+-//      );
+-//
++using NtQueryInformationThreadFn = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
++using RtlGetVersionFn = LONG(NTAPI*)(PRTL_OSVERSIONINFOW);
+ 
+-#define IsListEmpty(ListHead) \
+-    ((ListHead)->Flink == (ListHead))
++const IMAGE_TLS_DIRECTORY* g_tls_dir = nullptr;
++ULONG g_tls_index = 0;
++bool g_tls_active = false;
+ 
+-//
+-//  PLIST_ENTRY
+-//  RemoveHeadList(
+-//      PLIST_ENTRY ListHead
+-//      );
+-//
+-
+-#define RemoveHeadList(ListHead) \
+-    (ListHead)->Flink;\
+-    {RemoveEntryList((ListHead)->Flink)}
+-
+-//
+-//  PLIST_ENTRY
+-//  RemoveTailList(
+-//      PLIST_ENTRY ListHead
+-//      );
+-//
+-
+-#define RemoveTailList(ListHead) \
+-    (ListHead)->Blink;\
+-    {RemoveEntryList((ListHead)->Blink)}
+-
+-//
+-//  VOID
+-//  RemoveEntryList(
+-//      PLIST_ENTRY Entry
+-//      );
+-//
+-
+-#define RemoveEntryList(Entry) {\
+-    PLIST_ENTRY _EX_Blink;\
+-    PLIST_ENTRY _EX_Flink;\
+-    _EX_Flink = (Entry)->Flink;\
+-    _EX_Blink = (Entry)->Blink;\
+-    _EX_Blink->Flink = _EX_Flink;\
+-    _EX_Flink->Blink = _EX_Blink;\
+-    }
+-
+-//
+-//  VOID
+-//  InsertTailList(
+-//      PLIST_ENTRY ListHead,
+-//      PLIST_ENTRY Entry
+-//      );
+-//
+-
+-#define InsertTailList(ListHead,Entry) {\
+-    PLIST_ENTRY _EX_Blink;\
+-    PLIST_ENTRY _EX_ListHead;\
+-    _EX_ListHead = (ListHead);\
+-    _EX_Blink = _EX_ListHead->Blink;\
+-    (Entry)->Flink = _EX_ListHead;\
+-    (Entry)->Blink = _EX_Blink;\
+-    _EX_Blink->Flink = (Entry);\
+-    _EX_ListHead->Blink = (Entry);\
+-    }
+-
+-//
+-//  VOID
+-//  InsertHeadList(
+-//      PLIST_ENTRY ListHead,
+-//      PLIST_ENTRY Entry
+-//      );
+-//
+-
+-#define InsertHeadList(ListHead,Entry) {\
+-    PLIST_ENTRY _EX_Flink;\
+-    PLIST_ENTRY _EX_ListHead;\
+-    _EX_ListHead = (ListHead);\
+-    _EX_Flink = _EX_ListHead->Flink;\
+-    (Entry)->Flink = _EX_Flink;\
+-    (Entry)->Blink = _EX_ListHead;\
+-    _EX_Flink->Blink = (Entry);\
+-    _EX_ListHead->Flink = (Entry);\
+-    }
+-
+-//
+-//
+-//  PSINGLE_LIST_ENTRY
+-//  PopEntryList(
+-//      PSINGLE_LIST_ENTRY ListHead
+-//      );
+-//
+-
+-#define PopEntryList(ListHead) \
+-    (ListHead)->Next;\
+-    {\
+-        PSINGLE_LIST_ENTRY FirstEntry;\
+-        FirstEntry = (ListHead)->Next;\
+-        if (FirstEntry != NULL) {     \
+-            (ListHead)->Next = FirstEntry->Next;\
+-        }                             \
+-    }
+-
+-
+-//
+-//  VOID
+-//  PushEntryList(
+-//      PSINGLE_LIST_ENTRY ListHead,
+-//      PSINGLE_LIST_ENTRY Entry
+-//      );
+-//
+-
+-#define PushEntryList(ListHead,Entry) \
+-    (Entry)->Next = (ListHead)->Next; \
+-    (ListHead)->Next = (Entry)
+-
+-
+-#endif
+-NTSYSAPI
+-PVOID
+-NTAPI
+-RtlAllocateHeap(
+-    IN PVOID HeapHandle,
+-    IN ULONG Flags,
+-    IN SIZE_T Size
+-    );
+-
+-NTSYSAPI
+-BOOLEAN
+-NTAPI
+-RtlFreeHeap(
+-    IN PVOID HeapHandle,
+-    IN ULONG Flags,
+-    IN PVOID BaseAddress
+-    );
+-
+-NTSYSAPI
+-PVOID
+-NTAPI
+-RtlImageDirectoryEntryToData(
+-    PVOID BaseOfImage,
+-    BOOLEAN MappedAsImage,
+-    USHORT DirectoryEntry,
+-    PULONG Size
+-    );
+-
+-#define HEAP_MAKE_TAG_FLAGS( b, o ) ((ULONG)((b) + ((o) << 18)))  // winnt
+-#define RtlProcessHeap() (NtCurrentPeb()->ProcessHeap)
+-
+-#define RTL_HEAP_MAKE_TAG HEAP_MAKE_TAG_FLAGS
+-
+-#define LdrpCallInitRoutine(InitRoutine, DllHandle, Reason, Context)    \
+-    (InitRoutine)((DllHandle), (Reason), (Context))
+-
+-#ifdef __cplusplus
++template <typename T>
++T* FromVa(ULONG_PTR va) {
++  return reinterpret_cast<T*>(va);
+ }
+-#endif
+-
+-ULONG LdrpNumberOfTlsEntries;
+ 
+-NTSTATUS
+-LdrpInitializeTls (
+-    VOID
+-    )
+-{
+-    PLDR_DATA_TABLE_ENTRY Entry;
+-    PLIST_ENTRY Head,Next;
+-    PIMAGE_TLS_DIRECTORY TlsImage;
+-    ULONG TlsSize;
+-
+-    //
+-    // Walk through the loaded modules and look for TLS. If we find TLS,
+-    // lock in the module and add to the TLS chain.
+-    //
+-
+-    Head = &NtCurrentPeb()->Ldr->InLoadOrderModuleList;
+-    Next = Head->Flink;
+-
+-    while (Next != Head) {
+-
+-        Entry = CONTAINING_RECORD(Next, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
+-        Next = Next->Flink;
+-
+-        TlsImage = (PIMAGE_TLS_DIRECTORY)RtlImageDirectoryEntryToData(
+-                           Entry->DllBase,
+-                           TRUE,
+-                           IMAGE_DIRECTORY_ENTRY_TLS,
+-                           &TlsSize);
+-
+-        if (TlsImage &&
+-            TlsImage->AddressOfIndex
+-           ) {
+-            LdrpNumberOfTlsEntries = ( (*(PLONG)TlsImage->AddressOfIndex + 1 > LdrpNumberOfTlsEntries) ? (*(PLONG)TlsImage->AddressOfIndex + 1) : LdrpNumberOfTlsEntries ) ;
+-        }
+-    }
+-
+-    //
+-    // We now have walked through all static DLLs and know
+-    // all DLLs that reference thread local storage. Now we
+-    // just have to allocate the thread local storage for the current
+-    // thread and for all subsequent threads.
+-    //
+-
+-//  return LdrpAllocateTls ();
+-    return STATUS_SUCCESS;
++BYTE* CurrentTeb() {
++  return reinterpret_cast<BYTE*>(NtCurrentTeb());
+ }
+ 
+-
+-NTSTATUS
+-LdrpAllocateTls (
+-    IN PVOID DllBase,
+-    IN PTEB Teb
+-    )
+-{
+-    PVOID *TlsVector;
+-    HANDLE ProcessHeap;
+-    PIMAGE_TLS_DIRECTORY TlsImage;
+-    ULONG TlsSize;
+-
+-    //
+-    // Allocate the array of thread local storage pointers
+-    //
+-
+-        TlsImage = (PIMAGE_TLS_DIRECTORY)RtlImageDirectoryEntryToData(
+-                           DllBase,
+-                           TRUE,
+-                           IMAGE_DIRECTORY_ENTRY_TLS,
+-                           &TlsSize);
+-
+-
+-        if (!Teb)Teb = NtCurrentTeb();
+-        ProcessHeap = Teb->ProcessEnvironmentBlock->ProcessHeap;
+-
+-        TlsVector = (PVOID *)RtlAllocateHeap(ProcessHeap,0,sizeof(PVOID)*LdrpNumberOfTlsEntries);
+-
+-        if (!TlsVector) {
+-            return STATUS_NO_MEMORY;
+-        }
+-        //
+-        // NOTICE-2002/03/14-ELi
+-        // Zero out the new array of pointers, LdrpFreeTls frees the pointers
+-        // if the pointers are non-NULL
+-        //
+-        RtlZeroMemory( TlsVector, sizeof(PVOID)*LdrpNumberOfTlsEntries );
+-
+-            TlsVector[*(PLONG)TlsImage->AddressOfIndex] = RtlAllocateHeap(
+-                                                        ProcessHeap,
+-                                                        0,
+-                                                        TlsImage->EndAddressOfRawData - TlsImage->StartAddressOfRawData
+-                                                        );
+-            if (!TlsVector[*(PLONG)TlsImage->AddressOfIndex] ) {
+-                return STATUS_NO_MEMORY;
+-            }
+-
+-            //
+-            // Do the TLS Callouts
+-            //
+-
+-            RtlCopyMemory (
+-                TlsVector[*(PLONG)TlsImage->AddressOfIndex],
+-                (PVOID)TlsImage->StartAddressOfRawData,
+-                TlsImage->EndAddressOfRawData - TlsImage->StartAddressOfRawData
+-            );
+-            RtlCopyMemory(
+-                TlsVector,
+-                (PVOID)Teb->ThreadLocalStoragePointer,
+-                sizeof(PVOID) * (LdrpNumberOfTlsEntries - 1)
+-                );
+-
+-        Teb->ThreadLocalStoragePointer = TlsVector;
+-    return STATUS_SUCCESS;
++void** volatile* TlsField(BYTE* teb) {
++  return reinterpret_cast<void** volatile*>(teb + kTebTlsOffset);
+ }
+ 
+-VOID
+-LdrpCallTlsInitializers (
+-    IN PVOID DllBase,
+-    IN ULONG Reason
+-    )
+-{
+-    PIMAGE_TLS_DIRECTORY TlsImage;
+-    ULONG TlsSize;
+-    PIMAGE_TLS_CALLBACK *CallBackArray;
+-    PIMAGE_TLS_CALLBACK InitRoutine;
+-
+-    TlsImage = (PIMAGE_TLS_DIRECTORY)RtlImageDirectoryEntryToData(
+-                       DllBase,
+-                       TRUE,
+-                       IMAGE_DIRECTORY_ENTRY_TLS,
+-                       &TlsSize
+-                       );
+-
+-
+-    if (TlsImage) {
+-
+-            CallBackArray = (PIMAGE_TLS_CALLBACK *)TlsImage->AddressOfCallBacks;
+-            if ( CallBackArray ) {
+-                while (*CallBackArray) {
++bool NeedsTlsFix() {
++  const BYTE* peb = reinterpret_cast<const BYTE*>(NtCurrentTeb()->ProcessEnvironmentBlock);
++  const ULONG major = *reinterpret_cast<const ULONG*>(peb + kPebOsMajorOffset);
++  const ULONG minor = *reinterpret_cast<const ULONG*>(peb + kPebOsMinorOffset);
++  const USHORT build = *reinterpret_cast<const USHORT*>(peb + kPebOsBuildOffset);
+ 
+-                    InitRoutine = *CallBackArray++;
++  const bool old_os =
++      major < 6 || (major == 6 && minor == 0 && build < 5360);
++  if (!old_os)
++    return false;
+ 
+-                    LdrpCallInitRoutine(InitRoutine,
+-                                        DllBase,
+-                                        Reason,
+-                                        0);
+-                }
+-            }
+-
+-    }
++  // WerpInitiateRemoteRecovery detection for One Core API Compatibility
++  HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
++  return kernel32 && !GetProcAddress(kernel32, "WerpInitiateRemoteRecovery");
+ }
+ 
+-
+-PVOID NTAPI TlsQuerySystemInformation(_In_ SYSTEM_INFORMATION_CLASS SystemInformationClass, _Out_opt_ LPDWORD ReturnLength)
+-{
+-
+-    if (ReturnLength)
+-        *ReturnLength = 0;
+-
+-    NTSTATUS status;
+-    PVOID buffer = nullptr;
+-    ULONG len = 0;
+-
+-    do {
+-
+-        RtlFreeHeap(RtlProcessHeap(), 0, buffer);
+-        buffer = nullptr;
+-
+-        if (len) {
+-            len *= 2;
+-            buffer = RtlAllocateHeap(RtlProcessHeap(), 0, len);
+-            if (!buffer)
+-                return nullptr;
+-        }
+-
+-        status = NtQuerySystemInformation(SystemInformationClass, buffer, len, &len);
+-        if (NT_SUCCESS(status))
+-            break;
+-    } while (status == STATUS_INFO_LENGTH_MISMATCH);
+-
+-    if (ReturnLength)
+-        *ReturnLength = len;
+-    return buffer;
++const IMAGE_TLS_DIRECTORY* FindTlsDirectory(const void* image) {
++  const BYTE* base = static_cast<const BYTE*>(image);
++  const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
++  if (!base || dos->e_magic != IMAGE_DOS_SIGNATURE)
++    return nullptr;
++  const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
++  if (nt->Signature != IMAGE_NT_SIGNATURE)
++    return nullptr;
++  const IMAGE_DATA_DIRECTORY& dd =
++      nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
++  return dd.VirtualAddress
++             ? reinterpret_cast<const IMAGE_TLS_DIRECTORY*>(base + dd.VirtualAddress)
++             : nullptr;
+ }
+ 
+-VOID TlsFixInAllThread(PVOID DllBase)
+-{
+-
+-    auto pid = NtCurrentTeb()->ClientId.UniqueProcess;
+-    auto p_system_process_info = PSYSTEM_PROCESS_INFORMATION(TlsQuerySystemInformation(SystemProcessInformation, nullptr));
+-    if (!p_system_process_info) {
+-        return;
+-    }
+-
+-    auto p_process_info = p_system_process_info;
+-    while (true) {
+-        if (p_process_info->UniqueProcessId == pid) {
+-            OBJECT_ATTRIBUTES oa{};
+-            InitializeObjectAttributes(&oa, nullptr, 0, nullptr, nullptr);
+-            THREAD_BASIC_INFORMATION tbi{};
+-            NTSTATUS status = 0;
+-            PSYSTEM_THREAD_INFORMATION ThreadInfo = (PSYSTEM_THREAD_INFORMATION)(p_process_info + 1);
+-            for (ULONG i = 0; i < p_process_info->NumberOfThreads; ++i) {
+-                HANDLE hThread = nullptr;
+-                status = NtOpenThread(&hThread, THREAD_QUERY_INFORMATION, &oa, &ThreadInfo[i].ClientId);
+-
+-                if (NT_SUCCESS(status)) {
+-                    status = NtQueryInformationThread(hThread, ThreadBasicInformation, &tbi, sizeof(tbi), nullptr);
+-                    if (NT_SUCCESS(status) && !!tbi.TebBaseAddress->ThreadLocalStoragePointer) {
+-                        LdrpAllocateTls(DllBase, tbi.TebBaseAddress);
+-                    }
+-
+-                    CloseHandle(hThread);
+-                }
+-            }
+-
+-            break;
+-        }
+-
+-        if (!p_process_info->NextEntryOffset)
+-            break;
+-        p_process_info = PSYSTEM_PROCESS_INFORMATION(LPSTR(p_process_info) + p_process_info->NextEntryOffset);
+-    }
++ULONG FirstFreeTlsIndex(const void* self) {
++  ULONG count = 0;
++  const LIST_ENTRY* head =
++      &NtCurrentTeb()->ProcessEnvironmentBlock->Ldr->InMemoryOrderModuleList;
++  for (const LIST_ENTRY* e = head->Flink; e != head; e = e->Flink) {
++    const auto* entry = CONTAINING_RECORD(e, LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks);
++    if (!entry->DllBase || entry->DllBase == self)
++      continue;
++    const IMAGE_TLS_DIRECTORY* dir = FindTlsDirectory(entry->DllBase);
++    if (!dir || !dir->AddressOfIndex)
++      continue;
++    const ULONG used = *FromVa<const ULONG>(static_cast<ULONG_PTR>(dir->AddressOfIndex));
++    if (used + 1 > count)
++      count = used + 1;
++  }
++  return count;
++}
+ 
+-    RtlFreeHeap(RtlProcessHeap(), 0, p_system_process_info);
++void RunTlsCallbacks(PVOID module, DWORD reason) {
++  auto* cb = FromVa<PIMAGE_TLS_CALLBACK>(static_cast<ULONG_PTR>(g_tls_dir->AddressOfCallBacks));
++  for (; cb && *cb; ++cb)
++    (*cb)(module, reason, nullptr);
+ }
+ 
+-static void TLSInit_DllMain_ThreadAttach(PVOID DllBase)
+-{
+-    PPEB Peb;
++bool AllocateTlsFor(BYTE* teb, bool is_current_thread) {
++  void** volatile* field = TlsField(teb);
++  void** old_vec = *field;
++  const HANDLE heap = GetProcessHeap();
++  const ULONG index = g_tls_index;
++
++  SIZE_T old_count = 0;
++  if (old_vec) {
++    const SIZE_T bytes = HeapSize(heap, 0, old_vec);
++    if (bytes == static_cast<SIZE_T>(-1))
++      return false;
++    old_count = bytes / sizeof(void*);
++  }
++  if (old_count > index && old_vec[index])
++    return true;
++
++  const SIZE_T raw_size = static_cast<ULONG_PTR>(g_tls_dir->EndAddressOfRawData) -
++                          static_cast<ULONG_PTR>(g_tls_dir->StartAddressOfRawData);
++  const SIZE_T total = raw_size + g_tls_dir->SizeOfZeroFill;
++  void* block = HeapAlloc(heap, HEAP_ZERO_MEMORY, total ? total : 1);
++  if (!block)
++    return false;
++  CopyMemory(block, FromVa<const void>(static_cast<ULONG_PTR>(g_tls_dir->StartAddressOfRawData)),
++             raw_size);
++
++  if (old_count > index) {
++    InterlockedExchangePointer(reinterpret_cast<PVOID volatile*>(&old_vec[index]), block);
++    return true;
++  }
+ 
+-  if ( DllBase )
+-  {
+-    Peb = NtCurrentPeb();
+-    if ( Peb->OSMajorVersion < 6 )
+-    {
+-        LdrpAllocateTls (DllBase,NULL);
+-    }
++  void** new_vec = static_cast<void**>(
++      HeapAlloc(heap, HEAP_ZERO_MEMORY, (index + 1) * sizeof(void*)));
++  if (!new_vec) {
++    HeapFree(heap, 0, block);
++    return false;
+   }
++  if (old_count)
++    CopyMemory(new_vec, old_vec, old_count * sizeof(void*));
++  new_vec[index] = block;
++  InterlockedExchangePointer(reinterpret_cast<PVOID volatile*>(field), new_vec);
++  if (is_current_thread && old_vec)
++    HeapFree(heap, 0, old_vec);
++  return true;
+ }
+-static void TLSInit_DllMain_ProcessAttach(PVOID DllBase)
+-{
+-    PPEB Peb;
+-    PIMAGE_TLS_DIRECTORY TlsImage;
+-    ULONG TlsSize;
+ 
+-  if ( DllBase )
+-  {
+-    Peb = NtCurrentPeb();
+-    if ( Peb->OSMajorVersion < 6 )
+-    {
+-    TlsImage = (PIMAGE_TLS_DIRECTORY)RtlImageDirectoryEntryToData(
+-                       DllBase,
+-                       TRUE,
+-                       IMAGE_DIRECTORY_ENTRY_TLS,
+-                       &TlsSize
+-                       );
+-        if (TlsImage && !*(PLONG)TlsImage->AddressOfIndex) {
+-
+-            LdrpInitializeTls ();
++void FreeCurrentThreadTls() {
++  void** vec = *TlsField(CurrentTeb());
++  if (!vec)
++    return;
++  const HANDLE heap = GetProcessHeap();
++  const SIZE_T bytes = HeapSize(heap, 0, vec);
++  if (bytes == static_cast<SIZE_T>(-1) || bytes / sizeof(void*) <= g_tls_index)
++    return;
++  void* block = vec[g_tls_index];
++  vec[g_tls_index] = nullptr;
++  if (block)
++    HeapFree(heap, 0, block);
++}
+ 
+-            *(PLONG)TlsImage->AddressOfIndex = LdrpNumberOfTlsEntries++;
+-             LdrpAllocateTls(DllBase, NULL);
++bool TryAllocateTlsFor(BYTE* teb) {
++  __try {
++    return AllocateTlsFor(teb, false);
++  } __except (EXCEPTION_EXECUTE_HANDLER) {
++    return false;
++  }
++}
+ 
+-            LdrpCallTlsInitializers (DllBase, DLL_PROCESS_ATTACH);
+-            TlsFixInAllThread (DllBase);
+-        }
++void AllocateTlsForOtherThreads() {
++  auto query = reinterpret_cast<NtQueryInformationThreadFn>(
++      GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
++  if (!query)
++    return;
++  HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
++  if (snapshot == INVALID_HANDLE_VALUE)
++    return;
++
++  const DWORD pid = GetCurrentProcessId();
++  const DWORD tid = GetCurrentThreadId();
++  THREADENTRY32 te = {sizeof(te)};
++  for (BOOL ok = Thread32First(snapshot, &te); ok; ok = Thread32Next(snapshot, &te)) {
++    if (te.th32OwnerProcessID != pid || te.th32ThreadID == tid)
++      continue;
++    HANDLE thread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
++    if (!thread)
++      continue;
++    ThreadBasicInfo info = {};
++    if (query(thread, 0 , &info, sizeof(info), nullptr) >= 0 &&
++        info.exit_status == STILL_ACTIVE && info.teb_base) {
++      TryAllocateTlsFor(static_cast<BYTE*>(info.teb_base));
+     }
++    CloseHandle(thread);
+   }
++  CloseHandle(snapshot);
+ }
+ 
+-extern "C" BOOL WINAPI RawDllMain(HINSTANCE hModule, DWORD  dwReason, LPVOID lpReserved);
++bool OnProcessAttach(HINSTANCE module) {
++  if (!NeedsTlsFix())
++    return true;
++  const IMAGE_TLS_DIRECTORY* dir = FindTlsDirectory(module);
++  if (!dir || !dir->AddressOfIndex)
++    return true;
++  auto* index_ptr = FromVa<volatile ULONG>(static_cast<ULONG_PTR>(dir->AddressOfIndex));
++  if (*index_ptr != 0)
++    return true;
++
++  g_tls_dir = dir;
++  g_tls_index = FirstFreeTlsIndex(module);
++  *index_ptr = g_tls_index;
++
++  if (!AllocateTlsFor(CurrentTeb(), true)) {
++    *index_ptr = 0;
++    return false;
++  }
++  g_tls_active = true;
++  AllocateTlsForOtherThreads();
++  RunTlsCallbacks(module, DLL_PROCESS_ATTACH);
++  return true;
++}
+ 
+-extern "C" BOOL (WINAPI* _pRawDllMain)(HINSTANCE, DWORD, LPVOID) = &RawDllMain;
++}  // namespace
+ 
++extern "C" BOOL WINAPI RawDllMain(HINSTANCE module, DWORD reason, LPVOID reserved);
+ 
+-/***************************************************************************\
+-*
+-* RawDllMain
+-*
+-* RawDllMain() is called after the before CRT has fully ininitialized.
+-*
+-\***************************************************************************/
++extern "C" BOOL (WINAPI* _pRawDllMain)(HINSTANCE, DWORD, LPVOID) = &RawDllMain;
+ 
+-extern "C"
+-BOOL WINAPI
+-RawDllMain(HINSTANCE hModule, DWORD  dwReason, LPVOID lpReserved)
+-{
+-    UNREFERENCED_PARAMETER(hModule);
+-    UNREFERENCED_PARAMETER(lpReserved);
+-    
+-    switch (dwReason)
+-    {
++extern "C" BOOL WINAPI RawDllMain(HINSTANCE module, DWORD reason, LPVOID reserved) {
++  UNREFERENCED_PARAMETER(reserved);
++  switch (reason) {
+     case DLL_PROCESS_ATTACH:
+-        TLSInit_DllMain_ProcessAttach (hModule);
+-        break;
+-        
+-    case DLL_PROCESS_DETACH:
+-        break;
+-
++      return OnProcessAttach(module);
+     case DLL_THREAD_ATTACH:
+-        TLSInit_DllMain_ThreadAttach (hModule);
+-        break;
+-
++      if (g_tls_active && AllocateTlsFor(CurrentTeb(), true))
++        RunTlsCallbacks(module, DLL_THREAD_ATTACH);
++      break;
+     case DLL_THREAD_DETACH:
+-        break;
+-    }
+-
+-    return TRUE;
++      if (g_tls_active) {
++        RunTlsCallbacks(module, DLL_THREAD_DETACH);
++        FreeCurrentThreadTls();
++      }
++      break;
++    case DLL_PROCESS_DETACH:
++      if (g_tls_active) {
++        RunTlsCallbacks(module, DLL_PROCESS_DETACH);
++        g_tls_active = false;
++      }
++      break;
++  }
++  return TRUE;
+ }
++
+ #	ifdef DEBUGGER_WAIT_DIALOG
+ static INT_PTR CALLBACK DebuggerWaitDialogProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+ {
+Submodule third_party/webrtc 55e6231f44..bbd9f927be:
+diff --git a/third_party/webrtc/modules/desktop_capture/win/window_capturer_win_gdi.cc b/third_party/webrtc/modules/desktop_capture/win/window_capturer_win_gdi.cc
+index 2b50d08..5f612fe 100644
+--- a/third_party/webrtc/modules/desktop_capture/win/window_capturer_win_gdi.cc
++++ b/third_party/webrtc/modules/desktop_capture/win/window_capturer_win_gdi.cc
+@@ -303,6 +303,7 @@ WindowCapturerWinGdi::CaptureResults WindowCapturerWinGdi::CaptureFrame(
+   // on Windows 8.1 and later, PrintWindow is only used when the window is
+   // occluded. When the window is not occluded, it is much faster to capture
+   // the screen and to crop it to the window position and size.
++if (rtc_win::GetVersion() > rtc_win::Version::VERSION_PRE_XP) {
+   if (rtc_win::GetVersion() >= rtc_win::Version::VERSION_WIN8) {
+     // Special flag that makes PrintWindow to work on Windows 8.1 and later.
+     // Indeed certain apps (e.g. those using DirectComposition rendering) can't
+@@ -318,7 +319,7 @@ WindowCapturerWinGdi::CaptureResults WindowCapturerWinGdi::CaptureFrame(
+                   !previous_size_.equals(frame->size()))) {
+     result = PrintWindow(window_, mem_dc, 0);
+   }
+-
++}
+   // Aero is enabled or PrintWindow() failed, use BitBlt.
+   if (!result) {
+     result = BitBlt(mem_dc, 0, 0, frame->size().width(), frame->size().height(),
+diff --git a/third_party/webrtc/rtc_base/win/windows_version.cc b/third_party/webrtc/rtc_base/win/windows_version.cc
+index 5c1c558..a0c2270 100644
+--- a/third_party/webrtc/rtc_base/win/windows_version.cc
++++ b/third_party/webrtc/rtc_base/win/windows_version.cc
+@@ -180,11 +180,17 @@ namespace {
+ // Helper to map a major.minor.x.build version (e.g. 6.1) to a Windows release.
+ Version MajorMinorBuildToVersion(int major, int minor, int build) {
+   if ((major == 5) && (minor > 0)) {
++    if (minor == 5 || build <= 2542) {
++      return Version::VERSION_PRE_XP;
++    }
+     // Treat XP Pro x64, Home Server, and Server 2003 R2 as Server 2003.
+     return (minor == 1) ? VERSION_XP : VERSION_SERVER_2003;
+   } else if (major == 6) {
+     switch (minor) {
+       case 0:
++        if (build < 5360) {
++          return Version::VERSION_SERVER_2003;
++        }
+         // Treat Windows Server 2008 the same as Windows Vista.
+         return VERSION_VISTA;
+       case 1:
+diff --git a/ui/gfx/font_render_params_win.cc b/ui/gfx/font_render_params_win.cc
+index 6836e10bba..beda168d05 100644
+--- a/ui/gfx/font_render_params_win.cc
++++ b/ui/gfx/font_render_params_win.cc
+@@ -24,6 +24,7 @@
+ #include "ui/gfx/animation/animation.h"
+ #include "ui/gfx/font_util_win.h"
+ #include "ui/gfx/win/singleton_hwnd.h"
++#include "base/win/windows_version.h"
+ 
+ namespace gfx {
+ 
+@@ -95,6 +96,9 @@ class CachedFontRenderParams {
+         params_->subpixel_rendering = GetSubpixelRenderingGeometry();
+       }
+     }
++    if (base::win::GetVersion() <= base::win::Version::PRE_XP) {
++      params_->antialiasing = true;
++    }
+ 
+     if (base::FeatureList::IsEnabled(
+             features::kUseGammaContrastRegistrySettings)) {
+diff --git a/ui/gfx/platform_font_win.cc b/ui/gfx/platform_font_win.cc
+index 24b4ed0124..2eb80a4568 100644
+--- a/ui/gfx/platform_font_win.cc
++++ b/ui/gfx/platform_font_win.cc
+@@ -38,6 +38,7 @@
+ #include "ui/gfx/system_fonts_win.h"
+ #include "ui/gfx/win/direct_write.h"
+ #include "ui/gfx/win/scoped_set_map_mode.h"
++#include "base/win/windows_version.h"
+ 
+ namespace {
+ 
+@@ -218,8 +219,17 @@ HRESULT GetMatchingDirectWriteFont(LOGFONT* font_info,
+ 
+   hr = font_family->GetFirstMatchingFont(weight, stretch, style, dwrite_font);
+   if (FAILED(hr)) {
+-    base::debug::Alias(&matching_font_count);
+-    CHECK(false);
++    if (base::win::GetVersion() <= base::win::Version::PRE_XP) {
++      if (font_family->GetFontCount() > 0) {
++        hr = font_family->GetFont(0, dwrite_font);
++      }
++      if (FAILED(hr) || !*dwrite_font) {
++        return FAILED(hr) ? hr : E_FAIL;
++      }
++    } else {
++      base::debug::Alias(&matching_font_count);
++      CHECK(false);
++    }
+   }
+ 
+   std::wstring font_name;
+diff --git a/ui/gfx/win/hwnd_util.cc b/ui/gfx/win/hwnd_util.cc
+index fd609fe3ef..2311cb6144 100644
+--- a/ui/gfx/win/hwnd_util.cc
++++ b/ui/gfx/win/hwnd_util.cc
+@@ -224,9 +224,18 @@ bool IsWindowVisibleAndFullyOpaque(HWND hwnd, Rect* window_rect) {
+   // Filter out windows that do not have a simple rectangular region.
+   // GetWindowRgnBox() returns the same region type as GetWindowRgn(), without
+   // creating and deleting a GDI region for every window.
+-  RECT region_box;
+-  if (::GetWindowRgnBox(hwnd, &region_box) == COMPLEXREGION) {
+-    return false;
++  if (base::win::GetVersion() > base::win::Version::PRE_XP) {
++    RECT region_box;
++    if (::GetWindowRgnBox(hwnd, &region_box) == COMPLEXREGION) {
++      return false;
++    }
++  } else {
++    HRGN rgn = ::CreateRectRgn(0, 0, 0, 0);
++    int region_type = ::GetWindowRgn(hwnd, rgn);
++    ::DeleteObject(rgn);
++    if (region_type == COMPLEXREGION) {
++      return false;
++    }
+   }
+ 
+   // Windows 10 has cloaked windows, windows with WS_VISIBLE attribute but
+diff --git a/ui/gfx/win/window_impl.cc b/ui/gfx/win/window_impl.cc
+index b2943636f6..5f0c62e6b5 100644
+--- a/ui/gfx/win/window_impl.cc
++++ b/ui/gfx/win/window_impl.cc
+@@ -22,6 +22,7 @@
+ #include "base/win/wrapped_window_proc.h"
+ #include "ui/gfx/win/crash_id_helper.h"
+ #include "ui/gfx/win/hwnd_util.h"
++#include "base/win/windows_version.h"
+ 
+ namespace gfx {
+ 
+@@ -156,6 +157,9 @@ ATOM ClassRegistrar::RetrieveClassAtom(const ClassInfo& class_info) {
+       class_info.style, 0, 0, nullptr,
+       reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)), nullptr,
+       class_info.icon, class_info.small_icon, &window_class);
++  if (base::win::GetVersion() <= base::win::Version::PRE_XP) {
++      window_class.style &= ~CS_DROPSHADOW; 
++  }
+   HMODULE instance = window_class.hInstance;
+   ATOM atom = RegisterClassEx(&window_class);
+   if (!atom) {
+diff --git a/ui/native_theme/native_theme_win.cc b/ui/native_theme/native_theme_win.cc
+index b698c5f12d..4901efaba7 100644
+--- a/ui/native_theme/native_theme_win.cc
++++ b/ui/native_theme/native_theme_win.cc
+@@ -66,6 +66,7 @@
+ #include "ui/native_theme/caption_style_win.h"
+ #include "ui/native_theme/native_theme.h"
+ #include "ui/native_theme/os_settings_provider.h"
++#include "base/win/windows_version.h"
+ 
+ namespace ui {
+ 
+@@ -207,7 +208,7 @@ HANDLE GetThemeHandle(NativeTheme::Part part) {
+   }
+ 
+   HANDLE& handle = (*GetThemeHandles())[theme_class];
+-  if (!handle) {
++  if (!handle && base::win::GetVersion() >= base::win::Version::XP) {
+     handle = OpenThemeData(nullptr, theme_class.c_str());
+   }
+   return handle;
+diff --git a/ui/views/corewm/tooltip_win.cc b/ui/views/corewm/tooltip_win.cc
+index a3d33565ff..1f57deb9f9 100644
+--- a/ui/views/corewm/tooltip_win.cc
++++ b/ui/views/corewm/tooltip_win.cc
+@@ -7,6 +7,7 @@
+ #include "base/i18n/rtl.h"
+ #include "base/logging.h"
+ #include "base/strings/string_util_win.h"
++#include "base/win/windows_version.h"
+ #include "base/win/windowsx_shim.h"
+ #include "ui/aura/window.h"
+ #include "ui/base/l10n/l10n_util.h"
+@@ -24,7 +25,11 @@ namespace views::corewm {
+ TooltipWin::TooltipWin(HWND parent)
+     : parent_hwnd_(parent), tooltip_hwnd_(nullptr), showing_(false) {
+   memset(&toolinfo_, 0, sizeof(toolinfo_));
+-  toolinfo_.cbSize = sizeof(toolinfo_);
++  if (base::win::GetVersion() <= base::win::Version::PRE_XP) {
++    toolinfo_.cbSize = TTTOOLINFO_V1_SIZE;
++  } else {
++    toolinfo_.cbSize = sizeof(toolinfo_);
++  }
+   toolinfo_.uFlags = TTF_IDISHWND | TTF_TRACK | TTF_ABSOLUTE;
+   toolinfo_.uId = reinterpret_cast<UINT_PTR>(parent_hwnd_);
+   toolinfo_.hwnd = parent_hwnd_;
